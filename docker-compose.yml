@@ -12,7 +12,7 @@ services:
     image: swiss-job-hunter-backend
     env_file: .env
     ports:
-      - "8765:8765"
+      - "100.103.87.32:8765:8765"
     volumes:
       # Bind mount: drop cv.txt in from the host, keep the SQLite DB on disk.
       - ./data:/app/data
@@ -39,7 +39,7 @@ services:
         VITE_API_BASE_URL: "${VITE_API_BASE_URL:-http://localhost:8765}"
     image: swiss-job-hunter-frontend
     ports:
-      - "5173:80"
+      - "100.103.87.32:5173:80"
     depends_on:
       - backend
     restart: unless-stopped

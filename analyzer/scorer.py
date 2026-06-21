@@ -286,8 +286,13 @@ async def llm_score(cv_text: str, job_title: str, jd_text: str) -> MatchResult:
     from llm.router import call_llm
 
     system = (
-        "You are an expert technical recruiter evaluating a candidate for a job in Switzerland. "
-        "The candidate is a Senior ML/Perception Engineer specializing in autonomous driving. "
+        "You are an expert recruiter evaluating a candidate for a job in Switzerland. "
+        "Evaluate the candidate strictly from the supplied CV and job description. "
+        "Do not assume any skills, seniority, industry, education, or professional role "
+        "that is not explicitly supported by the supplied CV. "
+        "Consider transferable programme management, project management, IT service management, "
+        "platform, infrastructure, governance, vendor management, and stakeholder management experience "
+        "when these are relevant to the vacancy. "
         "Respond only with valid JSON."
     )
     user = f"""Evaluate this candidate's fit for the job.
