@@ -138,6 +138,7 @@ class JobScout24Scraper(BaseScraper):
                 salary_raw=salary_raw,
                 employment_type=emp,
                 posted_at=posted_at,
+                posted_at_source="api",
             )
         except Exception as exc:
             print(f"[jobscout24] json-ld parse error: {exc}")

@@ -10,6 +10,7 @@ from urllib.parse import quote_plus
 
 from playwright.async_api import async_playwright
 
+from analyzer.freshness import parse_posted_at
 from config.settings import settings
 from scrapers.base import BaseScraper, ScrapedJob
 
@@ -89,6 +90,7 @@ class EFinancialCareersScraper(BaseScraper):
 
             # Company name is the line after "Speichern" in the card text
             full_text = (await card.inner_text()).strip()
+            posted_at, posted_source = parse_posted_at(full_text)
             lines = [l.strip() for l in full_text.split("\n") if l.strip()]
             company = "Unknown"
             for i, line in enumerate(lines):
@@ -108,6 +110,8 @@ class EFinancialCareersScraper(BaseScraper):
                 url=url,
                 source=self.source_name,
                 source_job_id=job_id,
+                posted_at=posted_at,
+                posted_at_source=posted_source,
             )
         except Exception as exc:
             print(f"[efinancialcareers] parse error: {exc}")

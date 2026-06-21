@@ -154,16 +154,22 @@ async def call_llm(
     user: str,
     system: str = "You are a helpful assistant.",
     max_tokens: int = 1000,
-    provider: Optional[str] = None,  # override round-robin for this call
+    provider: Optional[str] = None,
+    operation: str = "job_screening",
+    model: Optional[str] = None,
 ) -> tuple[str, str]:
-    """
-    Call the next LLM provider in rotation.
+    """Route named operations through OpenRouter; keep explicit legacy providers."""
+    if settings.openrouter_api_key and (provider is None or provider == "openrouter"):
+        from llm.task_router import call_task_llm
+        return await call_task_llm(
+            user=user,
+            system=system,
+            max_tokens=max_tokens,
+            operation=operation,
+            model=model,
+        )
 
-    Returns:
-        (response_text, provider_used)  — so callers can log which provider ran.
-    """
     p = provider or _next_provider()
-
     if p == "anthropic":
         coro = _call_anthropic(system, user, max_tokens)
     elif p == "deepseek":
@@ -174,6 +180,4 @@ async def call_llm(
         coro = _call_ollama(system, user, max_tokens)
     else:
         raise ValueError(f"Unknown provider: {p}")
-
-    text = await asyncio.wait_for(coro, timeout=LLM_TIMEOUT)
-    return text, p
+    return await asyncio.wait_for(coro, timeout=LLM_TIMEOUT), p

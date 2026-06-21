@@ -44,7 +44,16 @@ def get_or_create_job(scraped: ScrapedJob, direction: Optional[str] = None) -> t
     with get_session() as session:
         existing = session.query(Job).filter(Job.dedup_hash == h).first()
         if existing:
-            session.expunge(existing)   # detach cleanly before session closes
+            if not existing.posted_at and scraped.posted_at:
+                existing.posted_at = scraped.posted_at
+                existing.posted_at_source = scraped.posted_at_source
+            if direction:
+                from db.models import JobProfile, SearchProfile
+                profile = session.query(SearchProfile).filter_by(slug=direction).first()
+                if profile and not session.get(JobProfile, (existing.id, profile.id)):
+                    session.add(JobProfile(job_id=existing.id, profile_id=profile.id))
+                    session.flush()
+            session.expunge(existing)
             return existing, False
 
         job = Job(
@@ -61,10 +70,16 @@ def get_or_create_job(scraped: ScrapedJob, direction: Optional[str] = None) -> t
             remote_ok=scraped.remote_ok,
             language_required=scraped.language_required,
             posted_at=scraped.posted_at,
+            posted_at_source=scraped.posted_at_source,
             direction=direction,
         )
         session.add(job)
-        session.flush()         # get DB-assigned id
-        session.refresh(job)    # ensure all columns are loaded into memory
-        session.expunge(job)    # detach cleanly before session closes
+        session.flush()
+        if direction:
+            from db.models import JobProfile, SearchProfile
+            profile = session.query(SearchProfile).filter_by(slug=direction).first()
+            if profile:
+                session.add(JobProfile(job_id=job.id, profile_id=profile.id))
+        session.refresh(job)
+        session.expunge(job)
         return job, True

@@ -107,6 +107,7 @@ class ZuriJobsScraper(BaseScraper):
                 source_job_id=url,
                 salary_raw=salary_raw,
                 posted_at=posted_at,
+                posted_at_source="api",
             )
         except Exception as exc:
             print(f"[züri.jobs] json-ld parse error: {exc}")

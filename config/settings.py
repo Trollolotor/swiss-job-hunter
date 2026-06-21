@@ -31,6 +31,7 @@ class Settings(BaseSettings):
     # ── OpenRouter ─────────────────────────────────────────────────────────────
     openrouter_api_key: str = Field(default="", description="OpenRouter API key")
     openrouter_model: str = "openai/gpt-4o-mini"
+    openrouter_default_model: str = ""
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
 
     # ── Ollama ─────────────────────────────────────────────────────────────────

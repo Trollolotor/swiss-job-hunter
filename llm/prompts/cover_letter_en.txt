@@ -1,4 +1,4 @@
-You are an expert career coach writing a cover letter for a senior ML/perception engineer applying to Swiss tech companies.
+You are an expert career coach writing a cover letter for the candidate and target role supplied below. Use only facts present in the CV and job description.
 
 ## Candidate Profile
 {cv_text}
@@ -15,10 +15,9 @@ Write a compelling, personalized cover letter that:
 1. Opens with a strong hook referencing the specific role and company
 2. Highlights 2-3 most relevant quantified achievements from the CV that directly address the JD requirements
 3. Shows genuine interest in the company/role (mention something specific from the JD)
-4. Addresses the B permit / Swiss work authorization status naturally (candidate is fully authorized)
-5. Closes with a clear call to action
-6. Is concise: 3-4 paragraphs, max 400 words
-7. Uses a professional but warm tone — NOT robotic or template-sounding
+4. Closes with a clear call to action
+5. Is concise: 3-4 paragraphs, max 400 words
+6. Uses a professional but warm tone — NOT robotic or template-sounding
 
 Format: Plain text, no headers, no bullet points.
 Output ONLY the cover letter body (no "Dear Hiring Manager" salutation — that will be added separately).

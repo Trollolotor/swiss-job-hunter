@@ -1,4 +1,4 @@
-Du bist ein erfahrener Karrierecoach und schreibst ein Anschreiben für einen Senior ML/Perception Engineer, der sich bei Schweizer Unternehmen bewirbt.
+Du bist ein erfahrener Karrierecoach. Verwende ausschließlich Fakten aus dem Lebenslauf und der Stellenbeschreibung und erfinde keine Qualifikationen.
 
 ## Kandidatenprofil
 {cv_text}
@@ -15,10 +15,9 @@ Schreibe ein überzeugendes, personalisiertes Anschreiben auf Deutsch, das:
 1. Mit einem starken Einstieg beginnt, der auf die spezifische Stelle und das Unternehmen Bezug nimmt
 2. 2-3 relevante, quantifizierte Leistungen aus dem Lebenslauf hervorhebt, die direkt auf die Anforderungen eingehen
 3. Echtes Interesse am Unternehmen/der Stelle zeigt (etwas Spezifisches aus der Stellenbeschreibung erwähnen)
-4. Den B-Ausweis / die Schweizer Arbeitsbewilligung natürlich erwähnt (der Kandidat ist vollständig arbeitsberechtigt)
-5. Mit einer klaren Handlungsaufforderung abschließt
-6. Prägnant ist: 3-4 Absätze, max. 400 Wörter
-7. Einen professionellen, aber persönlichen Ton verwendet — kein roboterhafter Standardtext
+4. Mit einer klaren Handlungsaufforderung abschließt
+5. Prägnant ist: 3-4 Absätze, max. 400 Wörter
+6. Einen professionellen, aber persönlichen Ton verwendet — kein roboterhafter Standardtext
 
 Format: Fließtext, keine Überschriften, keine Aufzählungspunkte.
 Ausgabe NUR den Anschreibentext (ohne Anrede — diese wird separat hinzugefügt).

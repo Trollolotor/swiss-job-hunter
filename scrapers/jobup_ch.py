@@ -81,6 +81,7 @@ class JobupChScraper(BaseScraper):
                 source=self.source_name,
                 source_job_id=str(doc.get("id", "")),
                 posted_at=posted_at,
+                posted_at_source="api",
                 raw_json=json.dumps(doc, ensure_ascii=False),
             )
         except Exception as exc:

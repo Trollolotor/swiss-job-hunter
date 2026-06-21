@@ -10,6 +10,7 @@ from urllib.parse import urlencode
 
 from bs4 import BeautifulSoup
 
+from analyzer.freshness import parse_posted_at
 from scrapers.base import BaseScraper, ScrapedJob
 
 _BASE_URL = "https://www.michaelpage.ch"
@@ -76,6 +77,9 @@ class MichaelPageScraper(BaseScraper):
                 for icon in type_el.select("i"):
                     icon.decompose()
                 employment_type = type_el.get_text(strip=True) or None
+            date_el = item.select_one("time, [class*=date], [class*=posted]")
+            date_value = (date_el.get("datetime", "") or date_el.get_text(" ", strip=True)) if date_el else ""
+            posted_at, posted_source = parse_posted_at(date_value)
 
             return ScrapedJob(
                 title=title,
@@ -86,6 +90,8 @@ class MichaelPageScraper(BaseScraper):
                 source=self.source_name,
                 source_job_id=url,
                 employment_type=employment_type,
+                posted_at=posted_at,
+                posted_at_source="html" if posted_at and posted_source == "api" else posted_source,
             )
         except Exception as exc:
             print(f"[michael-page] parse error: {exc}")

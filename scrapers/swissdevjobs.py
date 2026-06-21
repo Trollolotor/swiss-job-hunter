@@ -9,6 +9,7 @@ from urllib.parse import urlencode
 
 from playwright.async_api import async_playwright
 
+from analyzer.freshness import parse_posted_at
 from config.settings import settings
 from scrapers.base import BaseScraper, ScrapedJob
 
@@ -114,6 +115,8 @@ class SwissDevJobsScraper(BaseScraper):
                         break
 
             description = ""  # filled by Enrich step
+            card_text = await card.inner_text()
+            posted_at, posted_source = parse_posted_at(card_text)
 
             if not title:
                 return None
@@ -127,6 +130,8 @@ class SwissDevJobsScraper(BaseScraper):
                 source=self.source_name,
                 source_job_id=slug,
                 salary_raw=salary_raw,
+                posted_at=posted_at,
+                posted_at_source=posted_source,
             )
         except Exception as exc:
             print(f"[swissdevjobs] parse error: {exc}")

@@ -165,7 +165,7 @@ Rules:
 CV:
 {cv_text[:5000]}"""
 
-    raw, _ = await call_llm(user=user, system=system, max_tokens=1024)
+    raw, _ = await call_llm(user=user, system=system, max_tokens=1024, operation="keyword_extraction")
     raw = re.sub(r'^```[a-z]*\n?', '', raw.strip())
     raw = re.sub(r'\n?```$', '', raw)
     m = re.search(r'\[.*\]', raw, re.DOTALL)
@@ -311,7 +311,7 @@ Return ONLY valid JSON (no markdown):
   "explanation": "2-3 sentence assessment focusing on technical fit and role alignment"
 }}"""
 
-    raw, provider = await call_llm(user=user, system=system, max_tokens=1024)
+    raw, provider = await call_llm(user=user, system=system, max_tokens=1024, operation="job_screening")
 
     # Strip markdown fences
     raw = re.sub(r"^```[a-z]*\n?", "", raw.strip())
@@ -359,6 +359,16 @@ Return ONLY valid JSON (no markdown):
 
 def load_cv_text(path: Optional[Path] = None, direction: Optional[str] = None) -> str:
     if direction:
+        try:
+            from db.models import SearchProfile
+            from db.session import get_session, init_db
+            init_db()
+            with get_session() as session:
+                profile = session.query(SearchProfile).filter_by(slug=direction).first()
+                if profile and profile.cv_text.strip():
+                    return profile.cv_text
+        except Exception:
+            pass
         candidate = Path(f"./data/cv_{direction}.txt")
         if candidate.exists():
             return candidate.read_text(encoding="utf-8")

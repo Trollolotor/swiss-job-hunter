@@ -117,7 +117,7 @@ Rules:
 - suggestions: 3-6 most impactful changes only
 - Do NOT invent experience or skills the candidate doesn't have"""
 
-    raw, provider = await call_llm(user=user, system=system, max_tokens=2500)
+    raw, provider = await call_llm(user=user, system=system, max_tokens=2500, operation="cv_tailoring")
     print(f"[cv_tailor] generated via {provider}")
 
     raw = re.sub(r"^```[a-z]*\n?", "", raw.strip())

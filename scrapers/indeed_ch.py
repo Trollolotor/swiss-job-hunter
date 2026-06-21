@@ -8,6 +8,7 @@ import xml.etree.ElementTree as ET
 from typing import AsyncGenerator, Optional
 from urllib.parse import urlencode
 
+from analyzer.freshness import parse_posted_at
 from scrapers.base import BaseScraper, ScrapedJob
 
 _RSS_URL = "https://ch.indeed.com/rss"
@@ -103,6 +104,7 @@ class IndeedChScraper(BaseScraper):
 
             salary_el = item.find("{com.indeed}salary")
             salary_raw = salary_el.text.strip() if salary_el is not None and salary_el.text else None
+            posted_at, posted_source = parse_posted_at(item.findtext("pubDate") or item.findtext("date"))
 
             return ScrapedJob(
                 title=title,
@@ -113,6 +115,8 @@ class IndeedChScraper(BaseScraper):
                 source=self.source_name,
                 source_job_id=job_key or link,
                 salary_raw=salary_raw,
+                posted_at=posted_at,
+                posted_at_source=posted_source,
             )
         except Exception as exc:
             print(f"[indeed.ch] parse error: {exc}")

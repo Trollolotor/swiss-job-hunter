@@ -35,6 +35,7 @@ class ScrapedJob:
     remote_ok: Optional[bool] = None
     language_required: Optional[str] = None
     posted_at: Optional[datetime] = None
+    posted_at_source: str = "unknown"
     raw_html: Optional[str] = None
     raw_json: Optional[str] = None
     extra: dict = field(default_factory=dict)

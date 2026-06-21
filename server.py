@@ -34,6 +34,9 @@ app.add_middleware(
     expose_headers=["*"],
 )
 
+from api_ext import router as settings_router
+app.include_router(settings_router)
+
 
 @app.get("/directions")
 def get_directions():
@@ -66,59 +69,85 @@ def get_presets():
 
 # ── DB helpers ─────────────────────────────────────────────────────────────────
 
-def get_jobs_query(status: str = "all", q: str = "", direction: str = "all", min_stars: int = 0):
+def get_jobs_query(
+    status: str = "all", q: str = "", direction: str = "all", min_stars: int = 0,
+    profile_id: Optional[int] = None, published_within: Optional[int] = None,
+    sort: str = "priority",
+):
+    from analyzer.freshness import freshness, priority, utc_naive
+    from config.runtime import get_priority_config
     from db.session import get_session
-    from db.models import Job
+    from db.models import Job, SearchProfile
     from sqlalchemy import or_
 
+    config = get_priority_config()
     with get_session() as session:
         query = session.query(Job)
         if status != "all":
             query = query.filter(Job.status == status)
-        if direction != "all":
-            query = query.filter(Job.direction == direction)
+        if profile_id:
+            query = query.filter(Job.profiles.any(SearchProfile.id == profile_id))
+        elif direction != "all":
+            query = query.filter(or_(
+                Job.direction == direction,
+                Job.profiles.any(SearchProfile.slug == direction),
+            ))
         if q:
-            query = query.filter(
-                or_(
-                    Job.title.ilike(f"%{q}%"),
-                    Job.company.ilike(f"%{q}%"),
-                    Job.location.ilike(f"%{q}%"),
-                )
-            )
+            query = query.filter(or_(
+                Job.title.ilike(f"%{q}%"), Job.company.ilike(f"%{q}%"),
+                Job.location.ilike(f"%{q}%"),
+            ))
         if min_stars:
             query = query.filter(Job.user_stars >= min_stars)
-        jobs = query.order_by(Job.user_stars.desc().nullslast(), Job.match_score.desc().nullslast(), Job.scraped_at.desc()).all()
-        return [
-            {
-                "id": j.id,
-                "title": j.title,
-                "company": j.company,
-                "location": j.location,
-                "description": j.description,
-                "url": j.url,
-                "source": j.source,
-                "source_job_id": j.source_job_id,
-                "salary_raw": j.salary_raw,
-                "employment_type": j.employment_type,
-                "status": j.status,
-                "match_score": j.match_score,
-                "match_explanation": j.match_explanation,
-                "user_stars": j.user_stars,
+        jobs = query.all()
+        records = []
+        for j in jobs:
+            fresh_score, age_label, age_days = freshness(j.posted_at, config)
+            if published_within is not None and (
+                age_days is None or age_days > published_within
+            ):
+                continue
+            records.append({
+                "id": j.id, "title": j.title, "company": j.company,
+                "location": j.location, "description": j.description, "url": j.url,
+                "source": j.source, "source_job_id": j.source_job_id,
+                "salary_raw": j.salary_raw, "employment_type": j.employment_type,
+                "status": j.status, "match_score": j.match_score,
+                "match_explanation": j.match_explanation, "user_stars": j.user_stars,
                 "direction": j.direction,
+                "profiles": [{"id": p.id, "slug": p.slug, "name": p.name} for p in j.profiles],
                 "posted_at": j.posted_at.isoformat() if j.posted_at else None,
+                "posted_at_source": j.posted_at_source or "unknown",
                 "scraped_at": j.scraped_at.isoformat() if j.scraped_at else None,
-            }
-            for j in jobs
-        ]
+                "freshness_score": fresh_score, "age_label": age_label,
+                "age_days": age_days,
+                "priority_score": priority(j.match_score, fresh_score, config),
+            })
+    def timestamp(record, field):
+        value = record.get(field)
+        return utc_naive(datetime.fromisoformat(value)).timestamp() if value else -1
+    secondary = {
+        "newest": lambda r: timestamp(r, "posted_at"),
+        "match": lambda r: r["match_score"] if r["match_score"] is not None else -1,
+        "recently_found": lambda r: timestamp(r, "scraped_at"),
+        "priority": lambda r: r["priority_score"],
+    }.get(sort, lambda r: r["priority_score"])
+    records.sort(key=lambda r: (r["user_stars"] or 0, secondary(r)), reverse=True)
+    return records
 
 
 # ── Routes ─────────────────────────────────────────────────────────────────────
 
 @app.get("/jobs")
-def list_jobs(status: str = "all", q: str = "", direction: str = "all", min_stars: int = 0):
+def list_jobs(
+    status: str = "all", q: str = "", direction: str = "all", min_stars: int = 0,
+    profile_id: Optional[int] = None, published_within: str = "",
+    sort: str = "priority",
+):
     from db.session import init_db
     init_db()
-    return get_jobs_query(status, q, direction, min_stars)
+    days = int(published_within) if published_within.strip() else None
+    return get_jobs_query(status, q, direction, min_stars, profile_id, days, sort)
 
 
 @app.get("/stats")
@@ -231,6 +260,8 @@ class SearchRequest(BaseModel):
     pages: int = 3
     semantic: bool = False
     direction: Optional[str] = None
+    profile_id: Optional[int] = None
+    max_age_days: Optional[int] = None
     linkedin_time_range: str = "r604800"  # r86400=24h | r604800=7d | r2592000=30d
     linkedin_experience_level: str = "3,4"  # 2=Entry,3=Associate,4=Senior,5=Director
 
@@ -244,6 +275,21 @@ async def run_search(req: SearchRequest):
         from db.models import RawJob
         from db.session import get_session
         init_db()
+        active_direction = req.direction
+        profile_keywords: list[str] = []
+        if req.profile_id:
+            from db.models import SearchProfile
+            with get_session() as session:
+                profile = session.get(SearchProfile, req.profile_id)
+                if not profile:
+                    yield "✗ Search profile not found"
+                    return
+                active_direction = profile.slug
+                try:
+                    profile_keywords = json.loads(profile.keywords_json)
+                except json.JSONDecodeError:
+                    profile_keywords = []
+
 
         kw_list = req.keywords if req.keywords else [req.keyword]
         total_new = 0
@@ -272,12 +318,17 @@ async def run_search(req: SearchRequest):
                     async with scraper_cls(**kwargs) as scraper:
                         async for scraped in scraper.scrape(kw, req.location, req.pages):
                             found_count += 1
+                            if req.max_age_days is not None:
+                                if not scraped.posted_at:
+                                    continue
+                                from analyzer.freshness import utc_naive
+                                age = datetime.utcnow() - utc_naive(scraped.posted_at)
+                                if age.total_seconds() > req.max_age_days * 86400:
+                                    continue
                             if found_count % 10 == 0:
                                 yield f"  ↳ {source_name}: {found_count} fetched so far..."
                             try:
-                                if is_exact_duplicate(scraped.title, scraped.company, scraped.location):
-                                    continue
-                                job, created = get_or_create_job(scraped, direction=req.direction or None)
+                                job, created = get_or_create_job(scraped, direction=active_direction or None)
                                 if created:
                                     try:
                                         with get_session() as session:
@@ -472,8 +523,9 @@ async def run_analyze(req: AnalyzeRequest):
         import asyncio
         from asyncio import Queue
         from analyzer.scorer import fast_score, llm_score, load_cv_text, load_cv_keywords
-        from db.models import Job, JobStatus
+        from db.models import Job, JobStatus, SearchProfile
         from db.session import get_session
+        from sqlalchemy import or_
 
         try:
             cv_text = load_cv_text(direction=req.direction or None)
@@ -487,7 +539,7 @@ async def run_analyze(req: AnalyzeRequest):
                 statuses = [JobStatus.NEW, JobStatus.ANALYZED, JobStatus.SHORTLISTED, JobStatus.VIEWED, JobStatus.CONSIDERING]
             query = session.query(Job).filter(Job.status.in_(statuses))
             if req.direction:
-                query = query.filter(Job.direction == req.direction)
+                query = query.filter(or_(Job.direction == req.direction, Job.profiles.any(SearchProfile.slug == req.direction)))
             if req.skip_scored:
                 query = query.filter(Job.match_score.is_(None))
             lim = req.limit if req.skip_scored else 9999
@@ -657,6 +709,7 @@ async def _fetch_company_summary(name: str) -> str:
         system=_COMPANY_PROMPT,
         user=f"Company: {name}",
         max_tokens=300,
+        operation="company_summary",
     )
     return text
 
@@ -768,13 +821,14 @@ async def run_translate(req: TranslateRequest):
         f"You are a professional translator. Translate the following job description to {target_name}. "
         "Output only the translated text, preserving the structure and formatting. Do not add any preamble."
     )
-    text, _ = await call_llm(user=description, system=system, max_tokens=3000)
+    text, _ = await call_llm(user=description, system=system, max_tokens=3000, operation="translation")
     return {"translated": text}
 
 
 class CoverRequest(BaseModel):
     job_id: int
     language: str = "en"
+    direction: Optional[str] = None
 
 
 @app.post("/run/cover")
@@ -791,7 +845,7 @@ async def run_cover(req: CoverRequest):
         # Detach
         session.expunge(job)
 
-    cv_text = load_cv_text()
+    cv_text = load_cv_text(direction=req.direction or job.direction or None)
     letter = await generate_cover_letter(job, cv_text, language=req.language)
     return {"letter": letter}
 

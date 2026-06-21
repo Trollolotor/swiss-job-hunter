@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from "react";
+import SettingsView from "./SettingsView";
 
 const API = import.meta.env.VITE_API_BASE_URL ?? "http://localhost:8765";
 
@@ -464,8 +465,11 @@ export default function App() {
   const [keywordPresets, setKeywordPresets] = useState({});
   const [linkedinTimeRange, setLinkedinTimeRange] = useState("r604800");
   const [linkedinExpLevel, setLinkedinExpLevel] = useState("3,4");
-  const [direction, setDirection] = useState("all");
-  const [directions, setDirections] = useState(DIRECTIONS_FALLBACK);
+  const [direction, setDirection] = useState("");
+  const [profiles, setProfiles] = useState([]);
+  const [sortMode, setSortMode] = useState("priority");
+  const [publishedWithin, setPublishedWithin] = useState("");
+  const [searchMaxAge, setSearchMaxAge] = useState(14);
   const [mainTab, setMainTab] = useState("board");   // board | tracker
   const [rightTab, setRightTab] = useState("detail"); // detail | company | timeline | apply | tailor
   const [applyModal, setApplyModal] = useState(false);
@@ -482,13 +486,13 @@ export default function App() {
 
   const fetchJobs = useCallback(async () => {
     try {
-      const r = await fetch(`${API}/jobs?status=${filterStatus}&q=${encodeURIComponent(filterText)}&direction=${direction}&min_stars=${filterMinStars}`);
+      const r = await fetch(`${API}/jobs?status=${filterStatus}&q=${encodeURIComponent(filterText)}&direction=${direction||"all"}&min_stars=${filterMinStars}&sort=${sortMode}&published_within=${publishedWithin}`);
       if (r.ok) { setJobs(await r.json()); setBackendOk(true); }
     } catch {
       if (backendOk) addLog("✗ Backend offline — run: python server.py");
       setBackendOk(false);
     }
-  }, [filterStatus, filterText, direction, filterMinStars, addLog, backendOk]);
+  }, [filterStatus, filterText, direction, filterMinStars, sortMode, publishedWithin, addLog, backendOk]);
 
   const fetchStats = useCallback(async () => {
     try { const r=await fetch(`${API}/stats?threshold=${threshold/100}`); if(r.ok) setStats(await r.json()); } catch {}
@@ -508,8 +512,13 @@ export default function App() {
     fetch(`${API}/presets`).then(r=>r.ok?r.json():null).then(presets=>{
       if (presets && typeof presets === "object") setKeywordPresets(presets);
     }).catch(()=>{});
-    fetch(`${API}/directions`).then(r=>r.ok?r.json():null).then(dirs=>{
-      if (dirs && dirs.length) setDirections(dirs);
+    fetch(`${API}/profiles`).then(r=>r.ok?r.json():null).then(items=>{
+      const active = (items||[]).filter(p=>p.active);
+      setProfiles(active);
+      if (active.length) {
+        setDirection(d=>d||active[0].slug);
+        setSearchKws(k=>k.length===1&&k[0]==="Agent" ? active[0].keywords : k);
+      }
     }).catch(()=>{});
   }, []);
 
@@ -622,7 +631,7 @@ export default function App() {
     setLoading(p=>({...p, pipeline:true}));
     addLog("━━━ PIPELINE START ━━━");
     try {
-      await runStream("run/search", {keywords:kws, keyword:kws[0]||"", location:searchLoc, sources:searchSrc, pages:searchPages, semantic:false, direction:dir, linkedin_time_range:linkedinTimeRange, linkedin_experience_level:linkedinExpLevel}, "search");
+      await runStream("run/search", {keywords:kws, keyword:kws[0]||"", location:searchLoc, sources:searchSrc, pages:searchPages, semantic:false, max_age_days:searchMaxAge, profile_id:profiles.find(p=>p.slug===direction)?.id||null, direction:dir, linkedin_time_range:linkedinTimeRange, linkedin_experience_level:linkedinExpLevel}, "search");
       for (const src of (enrichSources.length ? enrichSources : [searchSrc[0]||"jobs.ch"])) {
         await runStream("run/enrich", {limit:9999, source:src, rescore_llm:false, direction:dir}, `enrich-${src}`);
       }
@@ -632,14 +641,14 @@ export default function App() {
       pipelineRunning.current = false;
       setLoading(p=>({...p, pipeline:false}));
     }
-  }, [searchKws, searchKwInput, searchSrc, searchLoc, searchPages, direction, linkedinTimeRange, linkedinExpLevel, threshold, runStream, addLog]);
+  }, [searchKws, searchKwInput, searchSrc, searchLoc, searchPages, direction, searchMaxAge, profiles, linkedinTimeRange, linkedinExpLevel, threshold, runStream, addLog]);
 
   const generateCover = async (job) => {
     setLoading(p=>({...p,cover:true}));
     try {
       const r = await fetch(`${API}/run/cover`,{
         method:"POST",headers:{"Content-Type":"application/json"},
-        body:JSON.stringify({job_id:job.id,language:coverLang}),
+        body:JSON.stringify({job_id:job.id,language:coverLang,direction}),
       });
       const d = await r.json();
       setCoverLetter(d.letter||"");
@@ -728,6 +737,7 @@ export default function App() {
           {/* Main tabs */}
           <Tab id="board" label="BOARD" active={mainTab==="board"} onClick={()=>setMainTab("board")}/>
           <Tab id="tracker" label="TRACKER" active={mainTab==="tracker"} onClick={()=>setMainTab("tracker")}/>
+          <Tab id="settings" label="SETTINGS" active={mainTab==="settings"} onClick={()=>setMainTab("settings")}/>
           <div style={{flex:1}}/>
           <span style={{fontSize:9,color:stats.total>0?"#34d399":"#5a7a68",fontFamily:"monospace"}}>
             ● {stats.total??0} JOBS IN DB
@@ -754,7 +764,9 @@ export default function App() {
         {/* BODY */}
         <div style={{flex:1,display:"flex",overflow:"hidden"}}>
 
-          {mainTab==="tracker"
+          {mainTab==="settings"
+            ? <SettingsView api={API} onProfilesChanged={()=>location.reload()}/>
+            : mainTab==="tracker"
             ? <TrackerBoard onSelectJob={j=>{setSelected(j);setMainTab("board");}}/>
             : <>
               {/* LEFT PANEL */}
@@ -767,17 +779,14 @@ export default function App() {
                 {/* Search */}
                 <div style={{padding:"6px 10px",borderBottom:"1px solid #d4dece"}}>
                   <div style={{fontSize:9,color:"#5a7a68",letterSpacing:"0.12em",fontWeight:700,marginBottom:4}}>① SEARCH</div>
-                  <div style={{display:"flex",gap:3,marginBottom:4}}>
-                    {["all",...directions].map(d=>(
-                      <button key={d} onClick={()=>setDirection(d)} style={{
-                        flex:1,fontSize:8,padding:"2px 0",borderRadius:3,border:"1px solid",
-                        borderColor:direction===d?"#2e7d5240":"#d4dece",
-                        background:direction===d?"#2e7d5215":"transparent",
-                        color:direction===d?"#2e7d52":"#6b8c7a",
-                        cursor:"pointer",fontFamily:"monospace",fontWeight:700,letterSpacing:"0.05em",
-                      }}>{d.toUpperCase()}</button>
-                    ))}
-                  </div>
+                  <select value={direction} onChange={e=>{
+                    const p=profiles.find(x=>x.slug===e.target.value);
+                    setDirection(e.target.value);
+                    if(p) { setSearchKws(p.keywords||[]); setSearchKwInput(""); }
+                  }} style={{...inp,marginBottom:4}} disabled={!profiles.length}>
+                    {!profiles.length&&<option value="">Create a role in Settings</option>}
+                    {profiles.map(p=><option key={p.id} value={p.slug}>{p.name}</option>)}
+                  </select>
                   {/* keyword presets */}
                   <div style={{display:"flex",gap:3,marginBottom:4}}>
                     {Object.entries(keywordPresets).map(([dir, kws])=>(
@@ -839,6 +848,14 @@ export default function App() {
                       onChange={e=>setSearchPages(Math.max(1,parseInt(e.target.value)||1))}
                       title="pages per source" style={{...inp,width:64,textAlign:"center"}}/>
                   </div>
+                  <div style={{display:"flex",gap:5,marginBottom:4,alignItems:"center"}}>
+                    <span style={{fontSize:9,color:"#5a7a68"}}>MAX AGE</span>
+                    <select value={searchMaxAge} onChange={e=>setSearchMaxAge(Number(e.target.value))} style={{...inp,flex:1}}>
+                      <option value={1}>24 hours</option><option value={3}>3 days</option>
+                      <option value={7}>7 days</option><option value={14}>14 days</option>
+                      <option value={30}>30 days</option>
+                    </select>
+                  </div>
                   <div style={{display:"flex",flexWrap:"wrap",gap:3,marginBottom:5}}>
                     <button onClick={()=>setSearchSrc(searchSrc.length===SOURCES.length?[]:SOURCES)} style={{
                       fontSize:8,padding:"2px 6px",borderRadius:3,border:"1px solid",
@@ -876,7 +893,7 @@ export default function App() {
                     const kws = searchKwInput.trim()
                       ? [...searchKws, searchKwInput.trim()]
                       : searchKws;
-                    runStream("run/search",{keywords:kws,keyword:kws[0]||"",location:searchLoc,sources:searchSrc,pages:searchPages,semantic:false,direction:direction==="all"?null:direction,linkedin_time_range:linkedinTimeRange,linkedin_experience_level:linkedinExpLevel},"search");
+                    runStream("run/search",{keywords:kws,keyword:kws[0]||"",location:searchLoc,sources:searchSrc,pages:searchPages,semantic:false,max_age_days:searchMaxAge,profile_id:profiles.find(p=>p.slug===direction)?.id||null,direction:direction==="all"?null:direction,linkedin_time_range:linkedinTimeRange,linkedin_experience_level:linkedinExpLevel},"search");
                   }} loading={loading.search} label="RUN SEARCH" icon="⬇" color="#2e7d52"/>
                   <Btn onClick={runPipeline}
                     loading={loading.pipeline}
@@ -953,6 +970,16 @@ export default function App() {
                       <span style={{fontSize:9,color:"#5a7a68",fontFamily:"monospace"}}>%</span>
                     </div>
                   </div>
+                  <div style={{display:"flex",gap:5,marginBottom:4}}>
+                    <select value={sortMode} onChange={e=>setSortMode(e.target.value)} style={{...inp,flex:1}}>
+                      <option value="priority">Priority</option><option value="newest">Newest</option>
+                      <option value="match">Best match</option><option value="recently_found">Recently found</option>
+                    </select>
+                    <select value={publishedWithin} onChange={e=>setPublishedWithin(e.target.value)} style={{...inp,flex:1}}>
+                      <option value="">Any date</option><option value="1">24h</option>
+                      <option value="3">3 days</option><option value="7">7 days</option><option value="14">14 days</option>
+                    </select>
+                  </div>
                   <div style={{display:"flex",alignItems:"center",gap:4}}>
                     <span style={{fontSize:9,color:"#5a7a68",fontFamily:"monospace"}}>★≥</span>
                     {[0,1,2,3,4,5].map(n=>(
@@ -1002,7 +1029,7 @@ export default function App() {
                         style={{
                           padding:"9px 14px",borderBottom:"1px solid #e8ede4",
                           borderLeft:"2px solid transparent",
-                          display:"grid",gridTemplateColumns:"26px 1fr 100px 66px 70px 52px 18px",
+                          display:"grid",gridTemplateColumns:"26px 1fr 90px 66px 54px 54px 70px 18px",
                           alignItems:"center",gap:8,cursor:"pointer",transition:"background 0.1s",
                         }}>
                         <span style={{fontSize:9,color:"#6b8c7a",fontWeight:700}}>#{j.id}</span>
@@ -1017,6 +1044,14 @@ export default function App() {
                         <div style={{display:"flex",flexDirection:"column",gap:2,alignItems:"flex-end"}}>
                           <ScoreBar score={j.match_score}/>
                           {j.user_stars && <Stars stars={j.user_stars} jobId={j.id} onUpdate={()=>{fetchJobs();fetchStats();}}/>}
+                        </div>
+                        <div title={j.posted_at ? `Published: ${j.posted_at}\nSource: ${j.posted_at_source}\nFreshness: ${Math.round(j.freshness_score*100)}%` : "Publication date unknown"}
+                          style={{fontSize:9,fontWeight:700,color:j.freshness_score>=.6?"#2e7d52":"#6b8c7a",textAlign:"right"}}>
+                          {j.age_label}
+                        </div>
+                        <div title={`Priority = match + freshness: ${Math.round(j.priority_score*100)}%`}
+                          style={{fontSize:9,fontWeight:800,color:"#a78bfa",textAlign:"right"}}>
+                          P {Math.round(j.priority_score*100)}%
                         </div>
                         <div style={{display:"flex",flexDirection:"column",alignItems:"flex-end",gap:2}}>
                           {j.direction&&<span style={{fontSize:7,fontFamily:"monospace",fontWeight:700,

@@ -119,6 +119,7 @@ class LinkedInRssScraper(BaseScraper):
                 source=self.source_name,
                 source_job_id=job_id or href,
                 posted_at=posted_at,
+                posted_at_source="api",
             )
         except Exception as exc:
             print(f"[linkedin] card parse error: {exc}")

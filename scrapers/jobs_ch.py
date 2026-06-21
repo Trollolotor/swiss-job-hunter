@@ -117,6 +117,7 @@ class JobsChScraper(BaseScraper):
                 salary_raw=salary_raw,
                 employment_type=employment_type,
                 posted_at=posted_at,
+                posted_at_source="api",
                 raw_json=json.dumps(doc, ensure_ascii=False),
             )
         except Exception as exc:

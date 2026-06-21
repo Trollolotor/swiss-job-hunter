@@ -79,6 +79,7 @@ class Job(Base):
     language_required: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
     skills_extracted: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     posted_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    posted_at_source: Mapped[str] = mapped_column(String(30), default="unknown")
 
     # Direction tag (e.g. "agent", "perception") — links job to a specific CV
     direction: Mapped[Optional[str]] = mapped_column(String(100), nullable=True, index=True)
@@ -105,6 +106,9 @@ class Job(Base):
     )
     events: Mapped[list[JobEvent]] = relationship(
         "JobEvent", back_populates="job", order_by="JobEvent.occurred_at"
+    )
+    profiles: Mapped[list["SearchProfile"]] = relationship(
+        "SearchProfile", secondary="job_profiles", back_populates="jobs"
     )
 
     __table_args__ = (
@@ -137,6 +141,70 @@ class RawJob(Base):
     __table_args__ = (
         UniqueConstraint("source", "source_job_id", name="uq_raw_source_id"),
     )
+
+
+class SearchProfile(Base):
+    """A named search role with its own queries and CV."""
+    __tablename__ = "search_profiles"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    slug: Mapped[str] = mapped_column(String(100), unique=True, index=True)
+    name: Mapped[str] = mapped_column(String(200))
+    keywords_json: Mapped[str] = mapped_column(Text, default="[]")
+    cv_text: Mapped[str] = mapped_column(Text, default="")
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=func.now(), onupdate=func.now())
+
+    jobs: Mapped[list["Job"]] = relationship(
+        "Job", secondary="job_profiles", back_populates="profiles"
+    )
+
+
+class JobProfile(Base):
+    __tablename__ = "job_profiles"
+
+    job_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("jobs.id", ondelete="CASCADE"), primary_key=True
+    )
+    profile_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("search_profiles.id", ondelete="CASCADE"), primary_key=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=func.now())
+
+
+class AppSetting(Base):
+    """Non-secret application settings stored as JSON values."""
+    __tablename__ = "app_settings"
+
+    key: Mapped[str] = mapped_column(String(100), primary_key=True)
+    value_json: Mapped[str] = mapped_column(Text)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=func.now(), onupdate=func.now())
+
+
+class LLMCallLog(Base):
+    __tablename__ = "llm_call_logs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    operation: Mapped[str] = mapped_column(String(50), index=True)
+    model: Mapped[str] = mapped_column(String(200))
+    latency_ms: Mapped[int] = mapped_column(Integer)
+    prompt_tokens: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    completion_tokens: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    fallback_index: Mapped[int] = mapped_column(Integer, default=0)
+    success: Mapped[bool] = mapped_column(Boolean, default=True)
+    error: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=func.now())
+
+
+class LLMCache(Base):
+    __tablename__ = "llm_cache"
+
+    cache_key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    operation: Mapped[str] = mapped_column(String(50), index=True)
+    model: Mapped[str] = mapped_column(String(200))
+    response_text: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=func.now())
 
 
 class Application(Base):
