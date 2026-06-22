@@ -689,14 +689,9 @@ async def run_purge_archived(req: PurgeRequest):
     return await sse(gen())
 
 
-_COMPANY_PROMPT = """\
-You are a research assistant helping a job seeker evaluate companies in Switzerland.
-Given a company name, provide a concise 3–5 sentence overview covering:
-- Industry and core business
-- Company size and Swiss/global presence
-- Reputation, work culture, or tech stack (if known)
-If the company is obscure or you are not confident about details, say so honestly — do not fabricate facts.
-Reply in English. No bullet points, plain prose only."""
+_COMPANY_PROMPT = (
+    Path(__file__).parent / "llm" / "prompts" / "company_summary.txt"
+).read_text(encoding="utf-8")
 
 
 def _normalize_company(name: str) -> str:
@@ -818,9 +813,8 @@ async def run_translate(req: TranslateRequest):
 
     target_name = "English" if req.target == "en" else "Simplified Chinese (中文)"
     system = (
-        f"You are a professional translator. Translate the following job description to {target_name}. "
-        "Output only the translated text, preserving the structure and formatting. Do not add any preamble."
-    )
+        Path(__file__).parent / "llm" / "prompts" / "translation.txt"
+    ).read_text(encoding="utf-8").format(target_name=target_name)
     text, _ = await call_llm(user=description, system=system, max_tokens=3000, operation="translation")
     return {"translated": text}
 
@@ -853,24 +847,39 @@ async def run_cover(req: CoverRequest):
 class TailorCVRequest(BaseModel):
     job_id: int
     direction: Optional[str] = None
+    profile_id: Optional[int] = None
 
 
 @app.post("/run/tailor-cv")
 async def run_tailor_cv(req: TailorCVRequest):
     from analyzer.scorer import load_cv_text
     from llm.cv_tailor import tailor_cv
-    from db.models import Job
+    import json as _json
+    from db.models import Job, SearchProfile
     from db.session import get_session
 
     with get_session() as session:
         job = session.get(Job, req.job_id)
         if not job:
             raise HTTPException(404, "Job not found")
-        direction = req.direction or job.direction or None
+        profile = None
+        if req.profile_id:
+            profile = session.get(SearchProfile, req.profile_id)
+        if not profile and req.direction:
+            profile = session.query(SearchProfile).filter_by(slug=req.direction).first()
+        if not profile and job.direction:
+            profile = session.query(SearchProfile).filter_by(slug=job.direction).first()
+        direction = profile.slug if profile else (req.direction or job.direction or None)
+        try:
+            sections = _json.loads(profile.cv_sections_json or "{}") if profile else None
+        except _json.JSONDecodeError:
+            sections = None
+        source_profile_id = profile.id if profile else None
         session.expunge(job)
 
     cv_text = load_cv_text(direction=direction)
-    result = await tailor_cv(job, cv_text)
+    result = await tailor_cv(job, cv_text, cv_sections=sections)
+    result["source_profile_id"] = source_profile_id
     return result
 
 

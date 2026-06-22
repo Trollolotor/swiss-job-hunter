@@ -1,0 +1,11 @@
+Evaluate the candidate's fit for the job.
+
+## Candidate CV
+{cv_text}
+
+## Job: {job_title}
+{jd_text}
+
+Return JSON matching the response schema.
+For every strong match, require explicit evidence in the CV.
+The explanation must be a concise 2–3 sentence assessment of role alignment.

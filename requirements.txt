@@ -22,6 +22,9 @@ openai>=1.30.0          # DeepSeek uses OpenAI-compatible API
 
 # PDF
 reportlab>=4.2.0
+pypdf>=5.0.0
+python-docx>=1.1.0
+python-multipart>=0.0.9
 
 # CLI
 typer>=0.12.0

@@ -45,6 +45,9 @@ Swiss Job Hunter automates the boring parts:
 | 🚀 | **One-click pipeline** — SEARCH + ENRICH + SCORE chains all three steps automatically, with LinkedIn cooldown between keywords |
 | 🏢 | **Company lookup** — LLM-generated company summaries, cached per company |
 | 📝 | **CV tailoring** — per-JD rewrite suggestions with ATS keyword gap analysis; heuristic JD section extraction strips boilerplate before passing to LLM |
+| 👤 | **Search profiles** — reusable role tags, default city, and structured LinkedIn-style CV sections |
+| 📄 | **CV import** — PDF/DOCX/TXT text extraction followed by schema-validated OpenRouter section parsing |
+| 🧬 | **Tailored profiles** — preview a complete tailored CV and save it as an independent role profile |
 | ✍ | **Cover letter generation** — personalized EN/DE letters via Claude API |
 | 🌐 | **Description translation** — translate JDs to English on demand |
 | 📋 | **Kanban tracker** — NEW → Viewed → Considering → Applied → Interview → Offer |
@@ -89,6 +92,7 @@ ANTHROPIC_API_KEY=sk-ant-...   # Claude (cover letters, LLM scoring, company loo
 DEEPSEEK_API_KEY=sk-...        # DeepSeek — cheaper alternative
 OPENROUTER_API_KEY=sk-or-...   # OpenRouter — access 100+ models via one key
 OPENROUTER_MODEL=openai/gpt-4o-mini  # any model slug from openrouter.ai/models
+OPENROUTER_DEFAULT_MODEL=openai/gpt-4o-mini  # inherited by per-operation routes
 OLLAMA_BASE_URL=http://localhost:11434/v1
 OLLAMA_MODEL=qwen3.6:latest
 LLM_PROVIDER=auto              # auto | anthropic | deepseek | openrouter | ollama

@@ -1,0 +1,14 @@
+Extract technical skills, tools, frameworks, and domain keywords from this CV.
+
+Assign weights:
+- 2.0: core expertise used extensively
+- 1.5: solid secondary skill
+- 1.0: supporting skill
+
+Use simple lowercase terms likely to occur in job descriptions. Include meaningful
+multi-word phrases and abbreviations as separate entries. Return 30–60 entries as
+a JSON array only, for example:
+[{{"keyword": "pytorch", "weight": 2.0}}]
+
+CV:
+{cv_text}

@@ -157,6 +157,7 @@ async def call_llm(
     provider: Optional[str] = None,
     operation: str = "job_screening",
     model: Optional[str] = None,
+    use_cache: bool = True,
 ) -> tuple[str, str]:
     """Route named operations through OpenRouter; keep explicit legacy providers."""
     if settings.openrouter_api_key and (provider is None or provider == "openrouter"):
@@ -167,6 +168,7 @@ async def call_llm(
             max_tokens=max_tokens,
             operation=operation,
             model=model,
+            use_cache=use_cache,
         )
 
     p = provider or _next_provider()

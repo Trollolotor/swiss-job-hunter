@@ -7,6 +7,7 @@ from typing import Any
 from config.settings import settings
 
 LLM_OPERATIONS = (
+    "cv_parsing",
     "keyword_extraction",
     "job_screening",
     "company_summary",
@@ -113,4 +114,3 @@ def validate_priority_config(value: dict[str, Any]) -> dict[str, Any]:
             raise ValueError("freshness buckets must be ascending with scores between 0 and 1")
         last = hours
     return config
-

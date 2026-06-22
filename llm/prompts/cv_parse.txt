@@ -1,0 +1,11 @@
+Split the CV below into the JSON sections defined by the response schema.
+
+Rules:
+- Preserve every factual detail, date, employer, title, metric, skill, and qualification.
+- Do not rewrite, improve, shorten, or infer content.
+- Put content under the closest matching section.
+- Put anything that does not fit elsewhere into "additional".
+- Return JSON only.
+
+CV:
+{cv_text}

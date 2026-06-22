@@ -152,6 +152,14 @@ class SearchProfile(Base):
     name: Mapped[str] = mapped_column(String(200))
     keywords_json: Mapped[str] = mapped_column(Text, default="[]")
     cv_text: Mapped[str] = mapped_column(Text, default="")
+    cv_sections_json: Mapped[str] = mapped_column(Text, default="{}")
+    default_location: Mapped[str] = mapped_column(String(200), default="Zürich")
+    parent_profile_id: Mapped[Optional[int]] = mapped_column(
+        Integer, ForeignKey("search_profiles.id"), nullable=True
+    )
+    tailored_for_job_id: Mapped[Optional[int]] = mapped_column(
+        Integer, ForeignKey("jobs.id"), nullable=True
+    )
     active: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=func.now(), onupdate=func.now())

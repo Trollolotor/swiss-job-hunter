@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import SettingsView from "./SettingsView";
+import TagEditor from "./TagEditor";
 
 const API = import.meta.env.VITE_API_BASE_URL ?? "http://localhost:8765";
 
@@ -451,9 +452,9 @@ export default function App() {
   const [log, setLog] = useState([]);
   const [loading, setLoading] = useState({});
   const pipelineRunning = useRef(false);
-  const [searchKws, setSearchKws] = useState(["Agent"]);
+  const [searchKws, setSearchKws] = useState([]);
   const [searchKwInput, setSearchKwInput] = useState("");
-  const [searchLoc, setSearchLoc] = useState("Zürich");
+  const [searchLoc, setSearchLoc] = useState("");
   const [searchSrc, setSearchSrc] = useState(["jobs.ch"]);
   const [filterStatus, setFilterStatus] = useState("all");
   const [filterText, setFilterText] = useState("");
@@ -470,10 +471,12 @@ export default function App() {
   const [sortMode, setSortMode] = useState("priority");
   const [publishedWithin, setPublishedWithin] = useState("");
   const [searchMaxAge, setSearchMaxAge] = useState(14);
+  const [searchDirty, setSearchDirty] = useState(false);
   const [mainTab, setMainTab] = useState("board");   // board | tracker
   const [rightTab, setRightTab] = useState("detail"); // detail | company | timeline | apply | tailor
   const [applyModal, setApplyModal] = useState(false);
   const [tailorResult, setTailorResult] = useState(null);
+  const [variantDraft, setVariantDraft] = useState(null);
   const [translatedDesc, setTranslatedDesc] = useState("");
   const [translating, setTranslating] = useState(false);
   const [showOriginalDesc, setShowOriginalDesc] = useState(false);
@@ -503,8 +506,8 @@ export default function App() {
   useEffect(() => {
     fetch(`${API}/config`).then(r=>r.ok?r.json():null).then(cfg=>{
       if (!cfg) return;
-      setSearchKws([cfg.default_keyword || "Agent"]);
-      setSearchLoc(cfg.default_location || "Zürich");
+      setSearchKws(current=>current.length?current:[cfg.default_keyword || "Agent"]);
+      setSearchLoc(current=>current || cfg.default_location || "Zürich");
       if (cfg.keyword_presets && typeof cfg.keyword_presets === "object") {
         setKeywordPresets(cfg.keyword_presets);
       }
@@ -517,7 +520,8 @@ export default function App() {
       setProfiles(active);
       if (active.length) {
         setDirection(d=>d||active[0].slug);
-        setSearchKws(k=>k.length===1&&k[0]==="Agent" ? active[0].keywords : k);
+        setSearchKws(active[0].keywords||[]);
+        setSearchLoc(active[0].default_location??"");
       }
     }).catch(()=>{});
   }, []);
@@ -571,6 +575,8 @@ export default function App() {
   const selectJob = useCallback(async (job) => {
     setSelected(job);
     setCoverLetter("");
+    setTailorResult(null);
+    setVariantDraft(null);
     setTranslatedDesc("");
     setShowOriginalDesc(false);
     setRightTab("detail");
@@ -661,16 +667,61 @@ export default function App() {
   const tailorCv = async (job) => {
     setLoading(p=>({...p, tailor:true}));
     setTailorResult(null);
+    setVariantDraft(null);
     try {
       const r = await fetch(`${API}/run/tailor-cv`, {
         method:"POST", headers:{"Content-Type":"application/json"},
-        body: JSON.stringify({job_id: job.id, direction: direction==="all"?null:direction}),
+        body: JSON.stringify({
+          job_id:job.id,
+          direction:direction==="all"?null:direction,
+          profile_id:profiles.find(p=>p.slug===direction)?.id||null,
+        }),
       });
       const d = await r.json();
       if (d.error) { addLog(`✗ Tailor CV: ${d.error}`); }
       else { setTailorResult(d); setRightTab("tailor"); addLog("✓ CV tailoring done"); }
     } catch(e) { addLog(`✗ ${e.message}`); }
     setLoading(p=>({...p, tailor:false}));
+  };
+
+  const saveSearchProfile = async () => {
+    const profile=profiles.find(p=>p.slug===direction);
+    if(!profile){addLog("✗ Select a profile first");return;}
+    try{
+      const r=await fetch(`${API}/profiles/${profile.id}/search-settings`,{
+        method:"PATCH",headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({keywords:searchKws,default_location:searchLoc}),
+      });
+      const saved=await r.json();
+      if(!r.ok)throw new Error(saved.detail||JSON.stringify(saved));
+      setProfiles(items=>items.map(p=>p.id===saved.id?saved:p));
+      setSearchKws(saved.keywords);setSearchLoc(saved.default_location);setSearchDirty(false);
+      addLog("✓ Search tags and city saved to "+saved.name);
+    }catch(e){addLog("✗ "+e.message);}
+  };
+
+  const prepareVariant = () => {
+    const profile=profiles.find(p=>p.id===tailorResult?.source_profile_id)||profiles.find(p=>p.slug===direction);
+    if(!profile||!selected)return;
+    const base=(profile.name+" — "+selected.title+" @ "+selected.company).slice(0,190);
+    const safe=(profile.slug+"-"+selected.title+"-"+selected.id).toLowerCase()
+      .replace(/[^a-z0-9_-]+/g,"-").replace(/^-+|-+$/g,"").slice(0,95);
+    setVariantDraft({name:base,slug:safe,source_profile_id:profile.id});
+  };
+
+  const saveVariant = async () => {
+    if(!variantDraft||!selected||!tailorResult?.tailored_cv_sections)return;
+    try{
+      const r=await fetch(`${API}/profiles/${variantDraft.source_profile_id}/variants`,{
+        method:"POST",headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({name:variantDraft.name,slug:variantDraft.slug,job_id:selected.id,cv_sections:tailorResult.tailored_cv_sections,active:true}),
+      });
+      const created=await r.json();
+      if(!r.ok)throw new Error(created.detail||JSON.stringify(created));
+      setProfiles(items=>[...items,created]);setDirection(created.slug);
+      setSearchKws(created.keywords);setSearchLoc(created.default_location);setSearchDirty(false);
+      setVariantDraft(null);addLog("✓ Tailored CV saved as profile "+created.name);
+    }catch(e){addLog("✗ "+e.message);}
   };
 
   const deleteJob = async (jobId) => {
@@ -782,7 +833,12 @@ export default function App() {
                   <select value={direction} onChange={e=>{
                     const p=profiles.find(x=>x.slug===e.target.value);
                     setDirection(e.target.value);
-                    if(p) { setSearchKws(p.keywords||[]); setSearchKwInput(""); }
+                    if(p) {
+                      setSearchKws(p.keywords||[]);
+                      setSearchLoc(p.default_location??"");
+                      setSearchKwInput("");
+                      setSearchDirty(false);
+                    }
                   }} style={{...inp,marginBottom:4}} disabled={!profiles.length}>
                     {!profiles.length&&<option value="">Create a role in Settings</option>}
                     {profiles.map(p=><option key={p.id} value={p.slug}>{p.name}</option>)}
@@ -790,54 +846,24 @@ export default function App() {
                   {/* keyword presets */}
                   <div style={{display:"flex",gap:3,marginBottom:4}}>
                     {Object.entries(keywordPresets).map(([dir, kws])=>(
-                      <button key={dir} onClick={()=>{ setSearchKws(kws); setSearchKwInput(""); setDirection(dir); }} style={{
+                      <button key={dir} onClick={()=>{
+                        const profile=profiles.find(p=>p.slug===dir);
+                        setSearchKws(kws);setSearchKwInput("");setSearchDirty(true);
+                        if(profile){setDirection(profile.slug);setSearchLoc(profile.default_location??"");}
+                      }} style={{
                         flex:1,fontSize:8,padding:"3px 0",borderRadius:3,border:"1px solid #2e7d5230",
                         background:"#2e7d5210",color:"#2e7d52",cursor:"pointer",
                         fontFamily:"monospace",fontWeight:700,letterSpacing:"0.04em",
                       }}>⚡ {dir.toUpperCase()}</button>
                     ))}
                   </div>
-                  {/* keyword tags */}
-                  <div style={{display:"flex",flexWrap:"wrap",gap:3,marginBottom:3}}>
-                    {searchKws.map((kw,i)=>(
-                      <span key={i} style={{
-                        display:"inline-flex",alignItems:"center",gap:3,
-                        fontSize:9,padding:"2px 6px",borderRadius:3,
-                        background:"#2e7d5220",border:"1px solid #2e7d5240",color:"#2e7d52",
-                        fontFamily:"monospace",fontWeight:700,
-                      }}>
-                        {kw}
-                        <span onClick={()=>setSearchKws(p=>p.filter((_,j)=>j!==i))}
-                          style={{cursor:"pointer",fontWeight:900,opacity:0.6,lineHeight:1}}>×</span>
-                      </span>
-                    ))}
+                  <div style={{marginBottom:4}}>
+                    <TagEditor value={searchKws} onChange={tags=>{setSearchKws(tags);setSearchDirty(true);}} placeholder="add search tag (Enter / comma)"/>
                   </div>
-                  <input value={searchKwInput}
-                    onChange={e=>{
-                      const v = e.target.value;
-                      if (v.endsWith(",")) {
-                        const kw = v.slice(0,-1).trim();
-                        if (kw && !searchKws.includes(kw)) setSearchKws(p=>[...p,kw]);
-                        setSearchKwInput("");
-                      } else {
-                        setSearchKwInput(v);
-                      }
-                    }}
-                    onKeyDown={e=>{
-                      if (e.key==="Enter") {
-                        const kw = searchKwInput.trim();
-                        if (kw && !searchKws.includes(kw)) setSearchKws(p=>[...p,kw]);
-                        setSearchKwInput("");
-                      } else if (e.key==="Backspace" && !searchKwInput && searchKws.length>0) {
-                        setSearchKws(p=>p.slice(0,-1));
-                      }
-                    }}
-                    placeholder={searchKws.length ? "add keyword (Enter/,)" : "keyword (Enter to add)"}
-                    style={{...inp,marginBottom:4}}/>
                   <div style={{display:"flex",gap:5,marginBottom:4}}>
-                    <input value={searchLoc} onChange={e=>setSearchLoc(e.target.value)}
+                    <input value={searchLoc} onChange={e=>{setSearchLoc(e.target.value);setSearchDirty(true);}}
                       placeholder="city (blank = all CH)" style={{...inp,flex:1}}/>
-                    <button onClick={()=>setSearchLoc("")} title="Search all Switzerland" style={{
+                    <button onClick={()=>{setSearchLoc("");setSearchDirty(true);}} title="Search all Switzerland" style={{
                       padding:"4px 7px",borderRadius:4,border:"1px solid",
                       borderColor:searchLoc===""?"#2e7d5240":"#d4dece",
                       background:searchLoc===""?"#2e7d5215":"transparent",
@@ -848,6 +874,8 @@ export default function App() {
                       onChange={e=>setSearchPages(Math.max(1,parseInt(e.target.value)||1))}
                       title="pages per source" style={{...inp,width:64,textAlign:"center"}}/>
                   </div>
+                  <Btn onClick={saveSearchProfile} disabled={!direction||!searchDirty}
+                    label={searchDirty?"SAVE TAGS + CITY":"SEARCH SETTINGS SAVED"} icon="💾" color="#2e7d52"/>
                   <div style={{display:"flex",gap:5,marginBottom:4,alignItems:"center"}}>
                     <span style={{fontSize:9,color:"#5a7a68"}}>MAX AGE</span>
                     <select value={searchMaxAge} onChange={e=>setSearchMaxAge(Number(e.target.value))} style={{...inp,flex:1}}>
@@ -1301,6 +1329,32 @@ export default function App() {
                             </div>
                           </div>
                         )}
+
+                        {tailorResult.tailored_cv_sections && (
+                          <div>
+                            <div style={{fontSize:9,fontWeight:700,color:"#5a7a68",letterSpacing:"0.1em",marginBottom:7}}>FULL TAILORED CV PREVIEW</div>
+                            {Object.entries(tailorResult.tailored_cv_sections).filter(([,text])=>text?.trim()).map(([section,text])=>(
+                              <details key={section} style={{borderBottom:"1px solid #d4dece",padding:"5px 0"}}>
+                                <summary style={{fontSize:10,fontWeight:700,color:"#2e7d52",cursor:"pointer",textTransform:"uppercase"}}>{section.replaceAll("_"," ")}</summary>
+                                <div style={{whiteSpace:"pre-wrap",fontSize:10,lineHeight:1.6,padding:"7px 3px",color:"#2a3e2a"}}>{text}</div>
+                              </details>
+                            ))}
+                          </div>
+                        )}
+
+                        {!variantDraft
+                          ? <Btn onClick={prepareVariant} disabled={!tailorResult.tailored_cv_sections||!tailorResult.source_profile_id}
+                              label="SAVE AS NEW PROFILE" icon="＋" color="#2e7d52"/>
+                          : <div style={{background:"#e2e8dc",border:"1px solid #d4dece",borderRadius:5,padding:10,display:"flex",flexDirection:"column",gap:6}}>
+                              <div style={{fontSize:9,fontWeight:700,color:"#2e7d52"}}>NEW TAILORED PROFILE</div>
+                              <input style={inp} value={variantDraft.name} onChange={e=>setVariantDraft({...variantDraft,name:e.target.value})} placeholder="Profile name"/>
+                              <input style={inp} value={variantDraft.slug} onChange={e=>setVariantDraft({...variantDraft,slug:e.target.value})} placeholder="profile-slug"/>
+                              <div style={{display:"flex",gap:6}}>
+                                <Btn onClick={saveVariant} label="CREATE PROFILE" icon="✓" color="#2e7d52"/>
+                                <Btn onClick={()=>setVariantDraft(null)} label="CANCEL" color="#6b8c7a"/>
+                              </div>
+                            </div>
+                        }
 
                         <Btn onClick={()=>tailorCv(selected)} loading={loading.tailor}
                           label="REGENERATE" icon="↻" color="#f59e0b"/>

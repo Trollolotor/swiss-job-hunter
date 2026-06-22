@@ -9,6 +9,15 @@ from typing import Optional
 from config.runtime import get_llm_config
 from config.settings import settings
 
+_semaphores: dict[tuple[int, str, int], asyncio.Semaphore] = {}
+
+
+def _semaphore(operation: str, limit: int) -> asyncio.Semaphore:
+    key = (id(asyncio.get_running_loop()), operation, limit)
+    if key not in _semaphores:
+        _semaphores[key] = asyncio.Semaphore(limit)
+    return _semaphores[key]
+
 
 def resolve_models(operation: str, explicit_model: Optional[str] = None) -> list[str]:
     config = get_llm_config()
@@ -78,6 +87,7 @@ async def call_task_llm(
     max_tokens: int,
     operation: str,
     model: Optional[str] = None,
+    use_cache: bool = True,
 ) -> tuple[str, str]:
     if not settings.openrouter_api_key:
         raise RuntimeError("OPENROUTER_API_KEY is required for task-based LLM routing")
@@ -88,6 +98,7 @@ async def call_task_llm(
     models = resolve_models(operation, model)
     retries = int(config.get("retries", 1))
     timeout = int(config.get("timeout", 120))
+    concurrency = int(config.get("concurrency", 10))
     client = AsyncOpenAI(
         api_key=settings.openrouter_api_key,
         base_url=settings.openrouter_base_url,
@@ -99,25 +110,27 @@ async def call_task_llm(
     last_error: Optional[Exception] = None
     for fallback_index, current_model in enumerate(models):
         key = _cache_key(operation, current_model, system, user, max_tokens)
-        cached = _cache_get(key)
+        cached = _cache_get(key) if use_cache else None
         if cached is not None:
             return cached, current_model
         for attempt in range(retries + 1):
             started = time.monotonic()
             try:
-                response = await asyncio.wait_for(
-                    client.chat.completions.create(
-                        model=current_model,
-                        max_tokens=max_tokens,
-                        messages=[
-                            {"role": "system", "content": system},
-                            {"role": "user", "content": user},
-                        ],
-                    ),
-                    timeout=timeout,
-                )
+                async with _semaphore(operation, concurrency):
+                    response = await asyncio.wait_for(
+                        client.chat.completions.create(
+                            model=current_model,
+                            max_tokens=max_tokens,
+                            messages=[
+                                {"role": "system", "content": system},
+                                {"role": "user", "content": user},
+                            ],
+                        ),
+                        timeout=timeout,
+                    )
                 text = (response.choices[0].message.content or "").strip()
-                _cache_put(key, operation, current_model, text)
+                if use_cache:
+                    _cache_put(key, operation, current_model, text)
                 usage = getattr(response, "usage", None)
                 _log(
                     operation, current_model, int((time.monotonic() - started) * 1000),
@@ -135,4 +148,3 @@ async def call_task_llm(
                 if attempt < retries:
                     await asyncio.sleep(min(2 ** attempt, 4))
     raise RuntimeError(f"All OpenRouter models failed for {operation}: {last_error}")
-

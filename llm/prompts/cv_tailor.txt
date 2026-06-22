@@ -1,0 +1,16 @@
+Tailor the complete candidate CV for the target job.
+
+## Job
+{job_title} at {company}
+{jd_text}
+
+## Original CV sections
+{cv_sections}
+
+Rules:
+- Preserve every supported fact from the original CV.
+- Never invent or imply experience the candidate does not have.
+- Rewrite only where it improves relevance or ATS clarity.
+- Return every CV section, including unchanged content.
+- Provide 3–8 highest-impact suggestions and genuine keyword gaps.
+- Return JSON matching the response schema only.
