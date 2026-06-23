@@ -80,6 +80,8 @@ class Job(Base):
     skills_extracted: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     posted_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     posted_at_source: Mapped[str] = mapped_column(String(30), default="unknown")
+    posted_at_raw: Mapped[Optional[str]] = mapped_column(String(300), nullable=True)
+    posted_at_confidence: Mapped[float] = mapped_column(Float, default=0.0)
 
     # Direction tag (e.g. "agent", "perception") — links job to a specific CV
     direction: Mapped[Optional[str]] = mapped_column(String(100), nullable=True, index=True)
@@ -94,6 +96,11 @@ class Job(Base):
     viewed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     applied_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     source_job_id: Mapped[Optional[str]] = mapped_column(String(300), nullable=True)
+    last_seen_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    availability_checked_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    unavailable_checks: Mapped[int] = mapped_column(Integer, default=0)
+    expired_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    expired_reason: Mapped[Optional[str]] = mapped_column(String(300), nullable=True)
 
     # Timestamps
     scraped_at: Mapped[datetime] = mapped_column(DateTime, default=func.now())
@@ -179,6 +186,9 @@ class JobProfile(Base):
         Integer, ForeignKey("search_profiles.id", ondelete="CASCADE"), primary_key=True
     )
     created_at: Mapped[datetime] = mapped_column(DateTime, default=func.now())
+    match_score: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    match_explanation: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    screened_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
 
 
 class AppSetting(Base):
@@ -215,6 +225,49 @@ class LLMCache(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=func.now())
 
 
+class PromptRevision(Base):
+    """Immediately-active, editable prompt with immutable revision history."""
+    __tablename__ = "prompt_revisions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    prompt_key: Mapped[str] = mapped_column(String(100), index=True)
+    operation: Mapped[str] = mapped_column(String(50), index=True)
+    language: Mapped[Optional[str]] = mapped_column(String(10), nullable=True)
+    revision: Mapped[int] = mapped_column(Integer)
+    system_template: Mapped[str] = mapped_column(Text)
+    user_template: Mapped[str] = mapped_column(Text)
+    required_variables_json: Mapped[str] = mapped_column(Text, default="[]")
+    temperature: Mapped[float] = mapped_column(Float, default=0.2)
+    max_tokens: Mapped[int] = mapped_column(Integer, default=2000)
+    active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("prompt_key", "revision", name="uq_prompt_key_revision"),
+    )
+
+
+class AutomationRun(Base):
+    __tablename__ = "automation_runs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    trigger: Mapped[str] = mapped_column(String(30), default="schedule")
+    status: Mapped[str] = mapped_column(String(30), default="running", index=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime, default=func.now())
+    finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    lease_until: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    stats_json: Mapped[str] = mapped_column(Text, default="{}")
+    error: Mapped[Optional[str]] = mapped_column(String(1000), nullable=True)
+
+
+class AutomationLease(Base):
+    __tablename__ = "automation_lease"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+    lease_until: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    run_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+
+
 class Application(Base):
     """Application record — cover letter, method, contact info."""
     __tablename__ = "applications"
@@ -241,7 +294,13 @@ class CompanyInfo(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     name: Mapped[str] = mapped_column(String(300), unique=True, index=True)
+    normalized_name: Mapped[Optional[str]] = mapped_column(String(300), nullable=True, index=True)
+    aliases_json: Mapped[str] = mapped_column(Text, default="[]")
+    industry: Mapped[Optional[str]] = mapped_column(String(200), nullable=True)
+    scope: Mapped[Optional[str]] = mapped_column(String(30), nullable=True)
     summary: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    model: Mapped[Optional[str]] = mapped_column(String(200), nullable=True)
+    prompt_revision: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     fetched_at: Mapped[datetime] = mapped_column(DateTime, default=func.now())
 
 

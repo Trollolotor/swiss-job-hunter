@@ -1,5 +1,8 @@
 Tailor the complete candidate CV for the target job.
 
+## Selected search role
+{role}
+
 ## Job
 {job_title} at {company}
 {jd_text}

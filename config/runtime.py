@@ -2,9 +2,14 @@
 from __future__ import annotations
 
 import json
+import time
+from copy import deepcopy
 from typing import Any
 
 from config.settings import settings
+
+_CACHE_TTL_SECONDS = 5.0
+_settings_cache: dict[str, tuple[float, dict[str, Any]]] = {}
 
 LLM_OPERATIONS = (
     "cv_parsing",
@@ -36,6 +41,29 @@ DEFAULT_PRIORITY_CONFIG: dict[str, Any] = {
     ],
 }
 
+DEFAULT_AUTOMATION_CONFIG: dict[str, Any] = {
+    "enabled": True,
+    "timezone": "Europe/Zurich",
+    "weekdays": [0, 1, 2, 3, 4],
+    "start_hour": 7,
+    "end_hour": 22,
+    "interval_minutes": 30,
+    "sources": ["jobs.ch", "jobscout24.ch", "jobup.ch", "linkedin.com"],
+    "pages_per_source": 3,
+    "max_age_days": 14,
+    "include_unknown_dates": True,
+    "enrich": True,
+    "screen": True,
+    "company_enrichment": True,
+    "enrich_limit": 100,
+    "date_backfill_limit": 20,
+    "screen_limit_per_profile": 20,
+    "company_limit": 10,
+    "availability_limit": 20,
+    "availability_interval_hours": 24,
+    "concurrency": 5,
+}
+
 
 def _merge(default: dict[str, Any], value: dict[str, Any]) -> dict[str, Any]:
     result = default.copy()
@@ -51,15 +79,22 @@ def get_setting(key: str, default: dict[str, Any]) -> dict[str, Any]:
     from db.models import AppSetting
     from db.session import get_session, init_db
 
+    cached = _settings_cache.get(key)
+    if cached and time.monotonic() - cached[0] < _CACHE_TTL_SECONDS:
+        return deepcopy(cached[1])
     init_db()
     with get_session() as session:
         row = session.get(AppSetting, key)
         if not row:
-            return default.copy()
+            value = deepcopy(default)
+            _settings_cache[key] = (time.monotonic(), value)
+            return deepcopy(value)
         try:
-            return _merge(default, json.loads(row.value_json))
+            value = _merge(default, json.loads(row.value_json))
         except (TypeError, json.JSONDecodeError):
-            return default.copy()
+            value = deepcopy(default)
+        _settings_cache[key] = (time.monotonic(), value)
+        return deepcopy(value)
 
 
 def put_setting(key: str, value: dict[str, Any]) -> None:
@@ -74,12 +109,38 @@ def put_setting(key: str, value: dict[str, Any]) -> None:
             row.value_json = encoded
         else:
             session.add(AppSetting(key=key, value_json=encoded))
+    _settings_cache.pop(key, None)
 
 
 def get_llm_config() -> dict[str, Any]:
     config = get_setting("llm", DEFAULT_LLM_CONFIG)
     if not config["default_model"]:
         config["default_model"] = settings.openrouter_default_model or settings.openrouter_model
+    return config
+
+
+def get_automation_config() -> dict[str, Any]:
+    return get_setting("automation", DEFAULT_AUTOMATION_CONFIG)
+
+
+def validate_automation_config(value: dict[str, Any]) -> dict[str, Any]:
+    config = _merge(DEFAULT_AUTOMATION_CONFIG, value)
+    config["interval_minutes"] = max(5, min(1440, int(config["interval_minutes"])))
+    config["start_hour"] = max(0, min(23, int(config["start_hour"])))
+    config["end_hour"] = max(1, min(24, int(config["end_hour"])))
+    if config["start_hour"] >= config["end_hour"]:
+        raise ValueError("start_hour must be before end_hour")
+    config["pages_per_source"] = max(1, min(20, int(config["pages_per_source"])))
+    config["max_age_days"] = max(1, min(365, int(config["max_age_days"])))
+    config["availability_limit"] = max(0, min(1000, int(config["availability_limit"])))
+    config["enrich_limit"] = max(0, min(1000, int(config["enrich_limit"])))
+    config["date_backfill_limit"] = max(0, min(1000, int(config["date_backfill_limit"])))
+    config["screen_limit_per_profile"] = max(0, min(500, int(config["screen_limit_per_profile"])))
+    config["company_limit"] = max(0, min(500, int(config["company_limit"])))
+    config["availability_interval_hours"] = max(1, min(720, int(config["availability_interval_hours"])))
+    config["concurrency"] = max(1, min(50, int(config["concurrency"])))
+    config["weekdays"] = sorted({int(day) for day in config.get("weekdays", []) if 0 <= int(day) <= 6})
+    config["sources"] = list(dict.fromkeys(str(s).strip() for s in config.get("sources", []) if str(s).strip()))
     return config
 
 

@@ -12,9 +12,8 @@ lxml>=5.2.0
 sqlalchemy>=2.0.0
 alembic>=1.13.0
 
-# Dedup
-sentence-transformers>=3.0.0
-numpy>=1.26.0
+# Exact dedup is built in. Optional semantic dedup dependencies live in
+# requirements-semantic.txt so the normal API image stays CPU-only and small.
 
 # LLM
 anthropic>=0.28.0
@@ -38,6 +37,7 @@ python-dotenv>=1.0.0
 # UI backend
 fastapi>=0.111.0
 uvicorn>=0.30.0
+apscheduler>=3.10.4
 
 # Email
 aiosmtplib>=3.0.0

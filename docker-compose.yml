@@ -12,6 +12,7 @@ services:
     image: swiss-job-hunter-backend
     env_file: .env
     ports:
+      # Standard local equivalent: "8765:8765"; bound explicitly for this deployment.
       - "100.103.87.32:8765:8765"
     volumes:
       # Bind mount: drop cv.txt in from the host, keep the SQLite DB on disk.
@@ -25,7 +26,7 @@ services:
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8765/config"]
-      interval: 30s
+      interval: 2m
       timeout: 5s
       retries: 5
       # Allow time for the embedding model to download on first boot.

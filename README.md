@@ -98,9 +98,9 @@ OLLAMA_MODEL=qwen3.6:latest
 LLM_PROVIDER=auto              # auto | anthropic | deepseek | openrouter | ollama
 ```
 
-> **LLM routing** — `auto` round-robins between every provider whose key is set.
-> Pin to a single provider with `LLM_PROVIDER=openrouter` (or `anthropic` / `deepseek`).
-> Only one key is required; all four can coexist.
+> **LLM routing** — when OpenRouter is configured, named operations use the default model
+> plus optional per-operation model and ordered fallback overrides from **Settings → AI Routing**.
+> API keys remain environment-only; model routes are stored in SQLite.
 
 ### 3. Add your CV
 
@@ -153,6 +153,10 @@ docker compose up -d --build
 
 The compose stack runs both the backend and the frontend with one command.
 
+The standard backend image uses exact deduplication and does not install PyTorch.
+For optional local embedding-based semantic deduplication, install
+`requirements-semantic.txt`; the web pipeline does not require it.
+
 ```bash
 docker compose logs -f backend   # follow backend logs
 docker compose down              # stop (data and model cache persist)
@@ -163,6 +167,14 @@ docker compose down              # stop (data and model cache persist)
 ---
 
 ## UI
+
+**Settings** contains role/CV profiles, OpenRouter routing, editable revisioned prompts,
+search-priority weights, and the automated pipeline. By default it runs all active profiles
+every 30 minutes on weekdays between 07:00 and 22:00 Europe/Zurich. Use **Run now** to
+start the same pipeline immediately or disable the schedule in Settings.
+Identical role/location queries are shared between profiles; enrichment, screening,
+company lookup, publication-date backfill, and availability checks use configurable
+per-run budgets so frequent discovery is not blocked by expensive downstream work.
 
 The sidebar guides you through the full pipeline:
 

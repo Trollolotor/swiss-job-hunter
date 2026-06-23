@@ -104,9 +104,11 @@ class LinkedInRssScraper(BaseScraper):
 
             time_el = card.select_one("time")
             posted_at = None
+            posted_raw = None
             if time_el and time_el.get("datetime"):
                 try:
-                    posted_at = datetime.fromisoformat(time_el["datetime"])
+                    posted_raw = time_el["datetime"]
+                    posted_at = datetime.fromisoformat(posted_raw)
                 except (ValueError, TypeError):
                     pass
 
@@ -119,7 +121,9 @@ class LinkedInRssScraper(BaseScraper):
                 source=self.source_name,
                 source_job_id=job_id or href,
                 posted_at=posted_at,
-                posted_at_source="api",
+                posted_at_source="html_time" if posted_at else "unknown",
+                posted_at_raw=posted_raw,
+                posted_at_confidence=0.8 if posted_at else 0.0,
             )
         except Exception as exc:
             print(f"[linkedin] card parse error: {exc}")

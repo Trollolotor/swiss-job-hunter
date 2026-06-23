@@ -34,17 +34,19 @@ def test_variant_inherits_search_settings():
     client = _client()
     source = next(p for p in client.get("/profiles").json() if p["slug"] == "profile-api-test")
     with get_session() as session:
-        job = Job(
-            dedup_hash="variant-test-job",
-            title="Platform Engineer",
-            company="Example",
-            location="Bern",
-            description="A sufficiently detailed description",
-            url="https://example.test/job",
-            source="test",
-        )
-        session.add(job)
-        session.flush()
+        job = session.query(Job).filter_by(dedup_hash="variant-test-job").first()
+        if not job:
+            job = Job(
+                dedup_hash="variant-test-job",
+                title="Platform Engineer",
+                company="Example",
+                location="Bern",
+                description="A sufficiently detailed description",
+                url="https://example.test/job",
+                source="test",
+            )
+            session.add(job)
+            session.flush()
         job_id = job.id
     response = client.post(f"/profiles/{source['id']}/variants", json={
         "name": "Tailored Platform",

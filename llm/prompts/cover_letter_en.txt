@@ -1,5 +1,7 @@
 You are an expert career coach writing a cover letter for the candidate and target role supplied below. Use only facts present in the CV and job description.
 
+Selected search role: {role}
+
 ## Candidate Profile
 {cv_text}
 

@@ -7,6 +7,7 @@ from contextlib import contextmanager
 import json
 from pathlib import Path
 import re
+import threading
 from typing import Generator
 
 from sqlalchemy import create_engine, event, inspect, text
@@ -44,17 +45,39 @@ def _get_engine() -> Engine:
 
 engine = _get_engine()
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+_initialized = False
+_init_lock = threading.Lock()
 
 
 def init_db() -> None:
     """Create/migrate tables and import legacy direction CVs. Idempotent."""
+    global _initialized
+    if _initialized:
+        return
+    with _init_lock:
+        if _initialized:
+            return
+        _init_db_once()
+        _initialized = True
+
+
+def _init_db_once() -> None:
     Base.metadata.create_all(bind=engine)
     columns = {c["name"] for c in inspect(engine).get_columns("jobs")}
-    if "posted_at_source" not in columns:
-        with engine.begin() as conn:
-            conn.execute(text(
-                "ALTER TABLE jobs ADD COLUMN posted_at_source VARCHAR(30) DEFAULT 'unknown'"
-            ))
+    job_additions = {
+        "posted_at_source": "VARCHAR(30) DEFAULT 'unknown'",
+        "posted_at_raw": "VARCHAR(300)",
+        "posted_at_confidence": "FLOAT DEFAULT 0.0",
+        "last_seen_at": "DATETIME",
+        "availability_checked_at": "DATETIME",
+        "unavailable_checks": "INTEGER DEFAULT 0",
+        "expired_at": "DATETIME",
+        "expired_reason": "VARCHAR(300)",
+    }
+    with engine.begin() as conn:
+        for name, sql_type in job_additions.items():
+            if name not in columns:
+                conn.execute(text(f"ALTER TABLE jobs ADD COLUMN {name} {sql_type}"))
     profile_columns = {c["name"] for c in inspect(engine).get_columns("search_profiles")}
     profile_additions = {
         "cv_sections_json": "TEXT DEFAULT '{}'",
@@ -66,6 +89,26 @@ def init_db() -> None:
         for name, sql_type in profile_additions.items():
             if name not in profile_columns:
                 conn.execute(text(f"ALTER TABLE search_profiles ADD COLUMN {name} {sql_type}"))
+    company_columns = {c["name"] for c in inspect(engine).get_columns("company_info")}
+    company_additions = {
+        "normalized_name": "VARCHAR(300)",
+        "aliases_json": "TEXT DEFAULT '[]'",
+        "industry": "VARCHAR(200)",
+        "scope": "VARCHAR(30)",
+        "model": "VARCHAR(200)",
+        "prompt_revision": "INTEGER",
+    }
+    with engine.begin() as conn:
+        for name, sql_type in company_additions.items():
+            if name not in company_columns:
+                conn.execute(text(f"ALTER TABLE company_info ADD COLUMN {name} {sql_type}"))
+    job_profile_columns = {c["name"] for c in inspect(engine).get_columns("job_profiles")}
+    with engine.begin() as conn:
+        for name, sql_type in {
+            "match_score": "FLOAT", "match_explanation": "TEXT", "screened_at": "DATETIME",
+        }.items():
+            if name not in job_profile_columns:
+                conn.execute(text(f"ALTER TABLE job_profiles ADD COLUMN {name} {sql_type}"))
     _import_legacy_profiles()
 
 

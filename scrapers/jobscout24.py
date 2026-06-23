@@ -21,6 +21,10 @@ _SEARCH_URL = f"{_BASE_URL}/en/jobs/"
 class JobScout24Scraper(BaseScraper):
     source_name = "jobscout24.ch"
 
+    def __init__(self, known_jobs: Optional[dict[str, dict]] = None) -> None:
+        super().__init__()
+        self.known_jobs = known_jobs or {}
+
     async def scrape(
         self, keyword: str, location: str = "Zürich", max_pages: int = 5
     ) -> AsyncGenerator[ScrapedJob, None]:
@@ -54,6 +58,20 @@ class JobScout24Scraper(BaseScraper):
                     continue
                 uuid = parts[-1]
                 seen.add(uuid)
+
+                known = self.known_jobs.get(uuid)
+                if known:
+                    new_on_page += 1
+                    yield ScrapedJob(
+                        title=known["title"], company=known["company"],
+                        location=known["location"], description=known.get("description", ""),
+                        url=known.get("url") or f"{_BASE_URL}{href}", source=self.source_name,
+                        source_job_id=uuid, posted_at=known.get("posted_at"),
+                        posted_at_source=known.get("posted_at_source", "unknown"),
+                        posted_at_raw=known.get("posted_at_raw"),
+                        posted_at_confidence=known.get("posted_at_confidence", 0.0),
+                    )
+                    continue
 
                 detail_url = f"{_BASE_URL}{href}"
                 try:
@@ -138,7 +156,7 @@ class JobScout24Scraper(BaseScraper):
                 salary_raw=salary_raw,
                 employment_type=emp,
                 posted_at=posted_at,
-                posted_at_source="api",
+                posted_at_source="json_ld" if posted_at else "unknown",
             )
         except Exception as exc:
             print(f"[jobscout24] json-ld parse error: {exc}")

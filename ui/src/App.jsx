@@ -489,13 +489,14 @@ export default function App() {
 
   const fetchJobs = useCallback(async () => {
     try {
-      const r = await fetch(`${API}/jobs?status=${filterStatus}&q=${encodeURIComponent(filterText)}&direction=${direction||"all"}&min_stars=${filterMinStars}&sort=${sortMode}&published_within=${publishedWithin}`);
-      if (r.ok) { setJobs(await r.json()); setBackendOk(true); }
+      const profileId=profiles.find(p=>p.slug===direction)?.id||"";
+      const r = await fetch(`${API}/jobs?status=${filterStatus}&q=${encodeURIComponent(filterText)}&direction=${direction||"all"}&profile_id=${profileId}&min_stars=${filterMinStars}&sort=${sortMode}&published_within=${publishedWithin}`);
+      if (r.ok) { const data=await r.json();setJobs(data);setSelected(current=>current?data.find(j=>j.id===current.id)||current:current);setBackendOk(true); }
     } catch {
       if (backendOk) addLog("✗ Backend offline — run: python server.py");
       setBackendOk(false);
     }
-  }, [filterStatus, filterText, direction, filterMinStars, sortMode, publishedWithin, addLog, backendOk]);
+  }, [filterStatus, filterText, direction, profiles, filterMinStars, sortMode, publishedWithin, addLog, backendOk]);
 
   const fetchStats = useCallback(async () => {
     try { const r=await fetch(`${API}/stats?threshold=${threshold/100}`); if(r.ok) setStats(await r.json()); } catch {}
@@ -556,21 +557,22 @@ export default function App() {
     setCompanyCache(p => ({...p, [name]: null})); // mark as checked, not cached
   }, [companyCache]);
 
-  const triggerCompanyLookup = useCallback(async (name) => {
+  const triggerCompanyLookup = useCallback(async (name,force=false) => {
     setLookingUpCompany(true);
     try {
       const r = await fetch(`${API}/companies/lookup`, {
         method: "POST", headers: {"Content-Type": "application/json"},
-        body: JSON.stringify({name}),
+        body: JSON.stringify({name,force}),
       });
       const d = await r.json();
       if (d.summary) {
         setCompanyCache(p => ({...p, [name]: d.summary}));
+        fetchJobs();
         addLog(`✓ Company info: ${name}`);
       }
     } catch (e) { addLog(`✗ ${e.message}`); }
     setLookingUpCompany(false);
-  }, [addLog]);
+  }, [addLog,fetchJobs]);
 
   const selectJob = useCallback(async (job) => {
     setSelected(job);
@@ -964,6 +966,9 @@ export default function App() {
                   <Btn onClick={()=>runStream("run/company-lookup",{min_score:threshold/100},"company-lookup")}
                     loading={loading["company-lookup"]} label="LOOKUP COMPANIES" icon="🏢"
                     color="#2e7d52" disabled={!stats.total}/>
+                  <Btn onClick={()=>confirm("Refresh structured info for all matching companies?")&&runStream("run/company-lookup",{min_score:threshold/100,force:true},"company-refresh")}
+                    loading={loading["company-refresh"]} label="REFRESH COMPANIES" icon="↻"
+                    color="#2e7d52" disabled={!stats.total}/>
                   <div style={{height:1,background:"#d4dece",margin:"2px 0"}}/>
                   <div style={{display:"flex",alignItems:"center",gap:5}}>
                     <Btn onClick={()=>runStream("run/purge-archived",{max_score:threshold/100,dry_run:true},"purge-preview")}
@@ -1065,7 +1070,7 @@ export default function App() {
                           <div style={{fontSize:11,fontWeight:600,color:"#1a2e20",marginBottom:2,
                             overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{j.title}</div>
                           <div style={{fontSize:9,color:"#5a7a68",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>
-                            {j.company} · {j.location}
+                            {j.company}{j.company_info?.industry||j.company_info?.scope?` (${[j.company_info?.industry,j.company_info?.scope].filter(Boolean).join(", ")})`:""} · {j.location}
                           </div>
                         </div>
                         <Badge status={j.status}/>
@@ -1073,7 +1078,7 @@ export default function App() {
                           <ScoreBar score={j.match_score}/>
                           {j.user_stars && <Stars stars={j.user_stars} jobId={j.id} onUpdate={()=>{fetchJobs();fetchStats();}}/>}
                         </div>
-                        <div title={j.posted_at ? `Published: ${j.posted_at}\nSource: ${j.posted_at_source}\nFreshness: ${Math.round(j.freshness_score*100)}%` : "Publication date unknown"}
+                        <div title={j.posted_at ? `Published: ${j.posted_at}\nSource: ${j.posted_at_source} (${Math.round((j.posted_at_confidence||0)*100)}% confidence)\nFreshness: ${Math.round(j.freshness_score*100)}%\nPriority = match × ${j.priority_match_weight} + freshness × ${j.priority_freshness_weight}` : "Publication date unknown; freshness = 0"}
                           style={{fontSize:9,fontWeight:700,color:j.freshness_score>=.6?"#2e7d52":"#6b8c7a",textAlign:"right"}}>
                           {j.age_label}
                         </div>
@@ -1226,16 +1231,17 @@ export default function App() {
                         <div style={{fontSize:14,fontWeight:700,color:"#1a2e20",marginBottom:3}}>
                           {selected.company}
                         </div>
+                        {(selected.company_info?.industry||selected.company_info?.scope)&&<div style={{fontSize:11,color:"#2e7d52",marginBottom:6}}>{[selected.company_info?.industry,selected.company_info?.scope].filter(Boolean).join(" · ")}</div>}
                         <div style={{fontSize:10,color:"#6b8c7a",marginBottom:16}}>
                           {selected.location}
                         </div>
                         {companyCache[selected.company]
-                          ? <div style={{
+                          ? <><div style={{
                               fontSize:11,color:"#2a3e2a",lineHeight:1.8,
                               whiteSpace:"pre-wrap",
                             }}>
                               {companyCache[selected.company]}
-                            </div>
+                            </div><button style={{marginTop:14,padding:"6px 12px",border:"1px solid #2e7d5235",background:"#2e7d520d",color:"#2e7d52",cursor:"pointer"}} onClick={()=>triggerCompanyLookup(selected.company,true)}>↻ REFRESH COMPANY</button></>
                           : <div style={{display:"flex",flexDirection:"column",alignItems:"center",gap:12,marginTop:40}}>
                               {companyCache[selected.company] === null
                                 ? <>

@@ -1,5 +1,8 @@
 Evaluate the candidate's fit for the job.
 
+## Selected role
+{role}
+
 ## Candidate CV
 {cv_text}
 

@@ -53,3 +53,24 @@ async def test_jobup_ch_scraper_parse():
     assert job.title == "Data Scientist"
     assert job.company == "Swiss Bank"
     assert job.source == "jobup.ch"
+
+
+@pytest.mark.asyncio
+async def test_jobscout_reuses_known_source_id_without_detail_fetch(monkeypatch):
+    from types import SimpleNamespace
+    from scrapers.jobscout24 import JobScout24Scraper
+
+    scraper = JobScout24Scraper(known_jobs={"known-id": {
+        "title": "Known Engineer", "company": "Known AG", "location": "Bern",
+        "description": "already enriched", "url": "https://example.test/known",
+    }})
+    async def fake_fetch(_url):
+        return SimpleNamespace(text='<a href="/en/job/known-id">Known</a>')
+    async def forbidden_detail(*_args):
+        raise AssertionError("known source IDs must not fetch detail pages")
+    monkeypatch.setattr(scraper, "_fetch", fake_fetch)
+    monkeypatch.setattr(scraper, "_fetch_detail", forbidden_detail)
+
+    jobs = [job async for job in scraper.scrape("engineer", "Bern", 1)]
+    assert len(jobs) == 1
+    assert jobs[0].source_job_id == "known-id"

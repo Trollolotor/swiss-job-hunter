@@ -56,9 +56,16 @@ async def _search(
 
     sem_dedup: Optional[SemanticDeduplicator] = None
     if semantic:
-        sem_dedup = SemanticDeduplicator()
-        n = sem_dedup.load_from_db()
-        console.print(f"[dim]Semantic dedup index: {n} jobs loaded[/dim]")
+        try:
+            sem_dedup = SemanticDeduplicator()
+            n = sem_dedup.load_from_db()
+            console.print(f"[dim]Semantic dedup index: {n} jobs loaded[/dim]")
+        except ImportError:
+            sem_dedup = None
+            console.print(
+                "[yellow]Semantic dedup is not installed; using exact dedup. "
+                "Install requirements-semantic.txt to enable it.[/yellow]"
+            )
 
     total_new = 0
 

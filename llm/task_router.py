@@ -10,6 +10,7 @@ from config.runtime import get_llm_config
 from config.settings import settings
 
 _semaphores: dict[tuple[int, str, int], asyncio.Semaphore] = {}
+_clients: dict[int, object] = {}
 
 
 def _semaphore(operation: str, limit: int) -> asyncio.Semaphore:
@@ -17,6 +18,24 @@ def _semaphore(operation: str, limit: int) -> asyncio.Semaphore:
     if key not in _semaphores:
         _semaphores[key] = asyncio.Semaphore(limit)
     return _semaphores[key]
+
+
+def _client():
+    """Reuse OpenRouter connection pools within each event loop."""
+    from openai import AsyncOpenAI
+    loop_id = id(asyncio.get_running_loop())
+    client = _clients.get(loop_id)
+    if client is None:
+        client = AsyncOpenAI(
+            api_key=settings.openrouter_api_key,
+            base_url=settings.openrouter_base_url,
+            default_headers={
+                "HTTP-Referer": "https://github.com/Donvink/swiss-job-hunter",
+                "X-Title": "Swiss Job Hunter",
+            },
+        )
+        _clients[loop_id] = client
+    return client
 
 
 def resolve_models(operation: str, explicit_model: Optional[str] = None) -> list[str]:
@@ -27,8 +46,9 @@ def resolve_models(operation: str, explicit_model: Optional[str] = None) -> list
     return list(dict.fromkeys([primary, *[str(m).strip() for m in fallbacks if str(m).strip()]]))
 
 
-def _cache_key(operation: str, model: str, system: str, user: str, max_tokens: int) -> str:
-    raw = "\0".join((operation, model, system, user, str(max_tokens)))
+def _cache_key(operation: str, model: str, system: str, user: str,
+               max_tokens: int, temperature: float = 0.2) -> str:
+    raw = "\0".join((operation, model, system, user, str(max_tokens), str(temperature)))
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
@@ -88,28 +108,20 @@ async def call_task_llm(
     operation: str,
     model: Optional[str] = None,
     use_cache: bool = True,
+    temperature: float = 0.2,
 ) -> tuple[str, str]:
     if not settings.openrouter_api_key:
         raise RuntimeError("OPENROUTER_API_KEY is required for task-based LLM routing")
-
-    from openai import AsyncOpenAI
 
     config = get_llm_config()
     models = resolve_models(operation, model)
     retries = int(config.get("retries", 1))
     timeout = int(config.get("timeout", 120))
     concurrency = int(config.get("concurrency", 10))
-    client = AsyncOpenAI(
-        api_key=settings.openrouter_api_key,
-        base_url=settings.openrouter_base_url,
-        default_headers={
-            "HTTP-Referer": "https://github.com/Donvink/swiss-job-hunter",
-            "X-Title": "Swiss Job Hunter",
-        },
-    )
+    client = _client()
     last_error: Optional[Exception] = None
     for fallback_index, current_model in enumerate(models):
-        key = _cache_key(operation, current_model, system, user, max_tokens)
+        key = _cache_key(operation, current_model, system, user, max_tokens, temperature)
         cached = _cache_get(key) if use_cache else None
         if cached is not None:
             return cached, current_model
@@ -121,6 +133,7 @@ async def call_task_llm(
                         client.chat.completions.create(
                             model=current_model,
                             max_tokens=max_tokens,
+                            temperature=temperature,
                             messages=[
                                 {"role": "system", "content": system},
                                 {"role": "user", "content": user},

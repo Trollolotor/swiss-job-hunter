@@ -36,9 +36,20 @@ class ScrapedJob:
     language_required: Optional[str] = None
     posted_at: Optional[datetime] = None
     posted_at_source: str = "unknown"
+    posted_at_raw: Optional[str] = None
+    posted_at_confidence: float = 0.0
     raw_html: Optional[str] = None
     raw_json: Optional[str] = None
     extra: dict = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.posted_at and not self.posted_at_raw:
+            self.posted_at_raw = self.posted_at.isoformat()
+        if self.posted_at and not self.posted_at_confidence:
+            self.posted_at_confidence = {
+                "api": 1.0, "json_ld": .95, "embedded_json": .9, "meta": .85,
+                "html_time": .8, "html": .7, "relative_text": .5,
+            }.get(self.posted_at_source, 0.0)
 
 
 class BaseScraper(ABC):

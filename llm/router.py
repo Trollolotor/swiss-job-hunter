@@ -158,6 +158,7 @@ async def call_llm(
     operation: str = "job_screening",
     model: Optional[str] = None,
     use_cache: bool = True,
+    temperature: float = 0.2,
 ) -> tuple[str, str]:
     """Route named operations through OpenRouter; keep explicit legacy providers."""
     if settings.openrouter_api_key and (provider is None or provider == "openrouter"):
@@ -169,6 +170,7 @@ async def call_llm(
             operation=operation,
             model=model,
             use_cache=use_cache,
+            temperature=temperature,
         )
 
     p = provider or _next_provider()

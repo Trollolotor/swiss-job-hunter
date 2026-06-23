@@ -9,6 +9,7 @@ import asyncio
 import json
 import sys
 import os
+from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import AsyncGenerator, Optional
@@ -23,7 +24,21 @@ from sqlalchemy import func
 
 from config.settings import settings
 
-app = FastAPI(title="Swiss Job Hunter API")
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    from db.session import init_db
+    from llm.prompt_manager import seed_prompts
+    from automation import start_scheduler, stop_scheduler
+    init_db()
+    seed_prompts()
+    start_scheduler()
+    try:
+        yield
+    finally:
+        await stop_scheduler()
+
+app = FastAPI(title="Swiss Job Hunter API", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -72,12 +87,13 @@ def get_presets():
 def get_jobs_query(
     status: str = "all", q: str = "", direction: str = "all", min_stars: int = 0,
     profile_id: Optional[int] = None, published_within: Optional[int] = None,
-    sort: str = "priority",
+    sort: str = "priority", include_unknown_dates: bool = True,
 ):
     from analyzer.freshness import freshness, priority, utc_naive
     from config.runtime import get_priority_config
     from db.session import get_session
-    from db.models import Job, SearchProfile
+    from db.models import Job, SearchProfile, CompanyInfo, JobProfile
+    from company_service import company_dict, normalize_company_name
     from sqlalchemy import or_
 
     config = get_priority_config()
@@ -100,28 +116,49 @@ def get_jobs_query(
         if min_stars:
             query = query.filter(Job.user_stars >= min_stars)
         jobs = query.all()
+        profile_matches = {}
+        if profile_id:
+            profile_matches = {row.job_id: row for row in session.query(JobProfile).filter_by(
+                profile_id=profile_id).all()}
+        company_rows = session.query(CompanyInfo).all()
+        companies = {row.normalized_name or normalize_company_name(row.name): company_dict(row)
+                     for row in company_rows}
         records = []
         for j in jobs:
             fresh_score, age_label, age_days = freshness(j.posted_at, config)
-            if published_within is not None and (
-                age_days is None or age_days > published_within
-            ):
-                continue
+            if published_within is not None:
+                if age_days is None and not include_unknown_dates:
+                    continue
+                if age_days is not None and age_days > published_within:
+                    continue
+            profile_match = profile_matches.get(j.id)
+            match_score = profile_match.match_score if profile_match and profile_match.match_score is not None else j.match_score
+            match_explanation = profile_match.match_explanation if profile_match and profile_match.match_explanation else j.match_explanation
             records.append({
                 "id": j.id, "title": j.title, "company": j.company,
                 "location": j.location, "description": j.description, "url": j.url,
                 "source": j.source, "source_job_id": j.source_job_id,
                 "salary_raw": j.salary_raw, "employment_type": j.employment_type,
-                "status": j.status, "match_score": j.match_score,
-                "match_explanation": j.match_explanation, "user_stars": j.user_stars,
+                "status": j.status, "match_score": match_score,
+                "match_explanation": match_explanation, "user_stars": j.user_stars,
                 "direction": j.direction,
+                "company_info": companies.get(normalize_company_name(j.company)),
                 "profiles": [{"id": p.id, "slug": p.slug, "name": p.name} for p in j.profiles],
                 "posted_at": j.posted_at.isoformat() if j.posted_at else None,
                 "posted_at_source": j.posted_at_source or "unknown",
+                "posted_at_raw": j.posted_at_raw,
+                "posted_at_confidence": j.posted_at_confidence or 0.0,
                 "scraped_at": j.scraped_at.isoformat() if j.scraped_at else None,
+                "last_seen_at": j.last_seen_at.isoformat() if j.last_seen_at else None,
+                "availability_checked_at": j.availability_checked_at.isoformat() if j.availability_checked_at else None,
+                "unavailable_checks": j.unavailable_checks or 0,
+                "expired_at": j.expired_at.isoformat() if j.expired_at else None,
+                "expired_reason": j.expired_reason,
                 "freshness_score": fresh_score, "age_label": age_label,
                 "age_days": age_days,
-                "priority_score": priority(j.match_score, fresh_score, config),
+                "priority_score": priority(match_score, fresh_score, config),
+                "priority_match_weight": config["match_weight"],
+                "priority_freshness_weight": config["freshness_weight"],
             })
     def timestamp(record, field):
         value = record.get(field)
@@ -142,12 +179,13 @@ def get_jobs_query(
 def list_jobs(
     status: str = "all", q: str = "", direction: str = "all", min_stars: int = 0,
     profile_id: Optional[int] = None, published_within: str = "",
-    sort: str = "priority",
+    sort: str = "priority", include_unknown_dates: bool = True,
 ):
     from db.session import init_db
     init_db()
     days = int(published_within) if published_within.strip() else None
-    return get_jobs_query(status, q, direction, min_stars, profile_id, days, sort)
+    return get_jobs_query(status, q, direction, min_stars, profile_id, days, sort,
+                          include_unknown_dates)
 
 
 @app.get("/stats")
@@ -262,6 +300,7 @@ class SearchRequest(BaseModel):
     direction: Optional[str] = None
     profile_id: Optional[int] = None
     max_age_days: Optional[int] = None
+    include_unknown_dates: bool = True
     linkedin_time_range: str = "r604800"  # r86400=24h | r604800=7d | r2592000=30d
     linkedin_experience_level: str = "3,4"  # 2=Entry,3=Associate,4=Senior,5=Director
 
@@ -319,12 +358,13 @@ async def run_search(req: SearchRequest):
                         async for scraped in scraper.scrape(kw, req.location, req.pages):
                             found_count += 1
                             if req.max_age_days is not None:
-                                if not scraped.posted_at:
+                                if not scraped.posted_at and not req.include_unknown_dates:
                                     continue
-                                from analyzer.freshness import utc_naive
-                                age = datetime.utcnow() - utc_naive(scraped.posted_at)
-                                if age.total_seconds() > req.max_age_days * 86400:
-                                    continue
+                                if scraped.posted_at:
+                                    from analyzer.freshness import utc_naive
+                                    age = datetime.utcnow() - utc_naive(scraped.posted_at)
+                                    if age.total_seconds() > req.max_age_days * 86400:
+                                        continue
                             if found_count % 10 == 0:
                                 yield f"  ↳ {source_name}: {found_count} fetched so far..."
                             try:
@@ -371,6 +411,7 @@ class EnrichRequest(BaseModel):
     source: str = "jobs.ch"
     rescore_llm: bool = False
     direction: Optional[str] = None
+    check_availability: bool = False
 
 
 @app.post("/run/enrich")
@@ -379,18 +420,13 @@ async def run_enrich(req: EnrichRequest):
         from db.models import Job
         from db.session import get_session
         with get_session() as session:
-            jobs = (
-                session.query(Job)
-                .filter(Job.source == req.source)
-                .filter(
-                    (Job.description == None) |  # noqa: E711
-                    (Job.description == "") |
+            query = session.query(Job).filter(Job.source == req.source)
+            if not req.check_availability:
+                query = query.filter(
+                    (Job.description == None) | (Job.description == "") |  # noqa: E711
                     (func.length(Job.description) < 100)
                 )
-                .order_by(Job.scraped_at.desc())
-                .limit(req.limit)
-                .all()
-            )
+            jobs = query.order_by(Job.scraped_at.desc()).limit(req.limit).all()
             import re as _re
             job_data = []
             for j in jobs:
@@ -410,9 +446,10 @@ async def run_enrich(req: EnrichRequest):
                     m = _re.search(r'/detail/([a-f0-9-]{36})', j.url)
                     sjid = m.group(1) if m else j.url
                 if sjid:
-                    job_data.append((j.id, sjid, dlen))
+                    job_data.append((j.id, sjid, dlen, j.url))
 
-        to_enrich = [(jid, sjid) for jid, sjid, dlen in job_data if dlen < 100]
+        to_enrich = [(jid, sjid, url) for jid, sjid, dlen, url in job_data
+                     if dlen < 100 or req.check_availability]
         yield f"Enriching {len(to_enrich)} jobs from {req.source}..."
 
         # Generic enrich — works for any scraper that implements fetch_full_description
@@ -441,7 +478,7 @@ async def run_enrich(req: EnrichRequest):
         enriched_ids = []
         try:
             async with scraper_cls() as scraper:
-                for job_id, source_job_id in to_enrich:
+                for job_id, source_job_id, job_url in to_enrich:
                     try:
                         result = await scraper.fetch_full_description(source_job_id)
                         if result and len(result) == 2 and len(result[0]) > 100:
@@ -452,6 +489,22 @@ async def run_enrich(req: EnrichRequest):
                                     job.description = desc
                                     if canonical_url:
                                         job.url = canonical_url
+                                    from job_lifecycle import mark_available
+                                    mark_available(job)
+                            try:
+                                from analyzer.publication import extract_publication_from_html
+                                detail_response = await scraper._fetch(canonical_url or job_url)
+                                published = extract_publication_from_html(detail_response.text)
+                                if published.value:
+                                    with get_session() as session:
+                                        job = session.get(Job, job_id)
+                                        if job and (not job.posted_at or published.confidence > (job.posted_at_confidence or 0)):
+                                            job.posted_at = published.value
+                                            job.posted_at_source = published.source
+                                            job.posted_at_raw = published.raw
+                                            job.posted_at_confidence = published.confidence
+                            except Exception:
+                                pass
                             updated += 1
                             enriched_ids.append(job_id)
                             yield f"✓ job #{job_id} — {len(desc)} chars"
@@ -459,9 +512,9 @@ async def run_enrich(req: EnrichRequest):
                             with get_session() as session:
                                 job = session.get(Job, job_id)
                                 if job:
-                                    from db.models import JobStatus
-                                    job.status = JobStatus.ARCHIVED
-                            yield f"– job #{job_id} — expired, auto-archived"
+                                    from job_lifecycle import mark_unavailable
+                                    mark_unavailable(job, "source returned 404/410 or explicit closure")
+                            yield f"– job #{job_id} — unavailable confirmation recorded"
                         else:
                             yield f"– job #{job_id} — no detail available"
                     except Exception as e:
@@ -489,7 +542,7 @@ async def run_enrich(req: EnrichRequest):
                         if job.match_score is not None:
                             continue  # already scored, skip
                         title, desc = job.title, job.description or ""
-                    result = await llm_score(cv_text, title, desc)
+                    result = await llm_score(cv_text, title, desc, role=req.direction or "General")
                     with get_session() as session:
                         job = session.get(Job, job_id)
                         if job:
@@ -523,7 +576,7 @@ async def run_analyze(req: AnalyzeRequest):
         import asyncio
         from asyncio import Queue
         from analyzer.scorer import fast_score, llm_score, load_cv_text, load_cv_keywords
-        from db.models import Job, JobStatus, SearchProfile
+        from db.models import Job, JobProfile, JobStatus, SearchProfile
         from db.session import get_session
         from sqlalchemy import or_
 
@@ -534,6 +587,8 @@ async def run_analyze(req: AnalyzeRequest):
             return
 
         with get_session() as session:
+            scoring_profile = session.query(SearchProfile).filter_by(slug=req.direction).first() if req.direction else None
+            scoring_profile_id = scoring_profile.id if scoring_profile else None
             statuses = list(JobStatus)  # all statuses when rescoring
             if req.skip_scored:
                 statuses = [JobStatus.NEW, JobStatus.ANALYZED, JobStatus.SHORTLISTED, JobStatus.VIEWED, JobStatus.CONSIDERING]
@@ -578,15 +633,23 @@ async def run_analyze(req: AnalyzeRequest):
                                     job.match_score = kw_result.score
                                     job.match_explanation = f"[keyword pre-filter] {kw_result.explanation}"
                                     job.status = JobStatus.ARCHIVED
+                                    link = session.get(JobProfile, (job_id, scoring_profile_id)) if scoring_profile_id else None
+                                    if link:
+                                        link.match_score, link.match_explanation = job.match_score, job.match_explanation
+                                        link.screened_at = datetime.utcnow()
                             skipped += 1
                             await queue.put(f"– #{job_id} {kw_result.score:.0%} (skipped) — {title[:45]}")
                         else:
-                            result = await llm_score(cv_text, title, description or "")
+                            result = await llm_score(cv_text, title, description or "", role=req.direction or "General")
                             with get_session() as session:
                                 job = session.get(Job, job_id)
                                 if job:
                                     job.match_score = result.score
                                     job.match_explanation = result.explanation
+                                    link = session.get(JobProfile, (job_id, scoring_profile_id)) if scoring_profile_id else None
+                                    if link:
+                                        link.match_score, link.match_explanation = result.score, result.explanation
+                                        link.screened_at = datetime.utcnow()
                                     if result.score >= threshold:
                                         job.status = JobStatus.SHORTLISTED
                                         shortlisted += 1
@@ -621,6 +684,10 @@ async def run_analyze(req: AnalyzeRequest):
                         if job:
                             job.match_score = result.score
                             job.match_explanation = result.explanation
+                            link = session.get(JobProfile, (job_id, scoring_profile_id)) if scoring_profile_id else None
+                            if link:
+                                link.match_score, link.match_explanation = result.score, result.explanation
+                                link.screened_at = datetime.utcnow()
                             job.status = JobStatus.SHORTLISTED if result.score >= threshold else JobStatus.ANALYZED
                             if result.score >= threshold:
                                 shortlisted += 1
@@ -689,67 +756,38 @@ async def run_purge_archived(req: PurgeRequest):
     return await sse(gen())
 
 
-_COMPANY_PROMPT = (
-    Path(__file__).parent / "llm" / "prompts" / "company_summary.txt"
-).read_text(encoding="utf-8")
-
-
-def _normalize_company(name: str) -> str:
-    return name.strip()
-
-
-async def _fetch_company_summary(name: str) -> str:
-    from llm.router import call_llm
-    text, _ = await call_llm(
-        system=_COMPANY_PROMPT,
-        user=f"Company: {name}",
-        max_tokens=300,
-        operation="company_summary",
-    )
-    return text
-
-
 @app.get("/companies/{name}")
 async def get_company(name: str):
+    from company_service import company_dict, find_company
     from db.session import get_session, init_db
-    from db.models import CompanyInfo
     init_db()
     with get_session() as session:
-        row = session.query(CompanyInfo).filter(CompanyInfo.name == _normalize_company(name)).first()
+        row = find_company(session, name)
         if row:
-            return {"name": row.name, "summary": row.summary, "fetched_at": row.fetched_at.isoformat()}
+            return company_dict(row)
     return {"name": name, "summary": None}
 
 
 @app.post("/companies/lookup")
 async def lookup_company(body: dict):
-    from db.session import get_session, init_db
-    from db.models import CompanyInfo
-    init_db()
-    name = _normalize_company(body.get("name", ""))
-    if not name:
-        raise HTTPException(400, "name required")
+    from company_service import enrich_company
+    try:
+        result, cached = await enrich_company(str(body.get("name", "")), bool(body.get("force")))
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return {**result, "cached": cached}
 
-    with get_session() as session:
-        row = session.query(CompanyInfo).filter(CompanyInfo.name == name).first()
-        if row and row.summary:
-            return {"name": row.name, "summary": row.summary, "cached": True}
 
-    summary = await _fetch_company_summary(name)
-
-    with get_session() as session:
-        row = session.query(CompanyInfo).filter(CompanyInfo.name == name).first()
-        if row:
-            row.summary = summary
-            row.fetched_at = datetime.utcnow()
-        else:
-            session.add(CompanyInfo(name=name, summary=summary))
-
-    return {"name": name, "summary": summary, "cached": False}
+@app.post("/companies/{name}/refresh")
+async def refresh_company(name: str):
+    from company_service import enrich_company
+    result, _ = await enrich_company(name, force=True)
+    return {**result, "cached": False}
 
 
 class CompanyLookupRequest(BaseModel):
     min_score: float = 0.0
+    force: bool = False
 
 
 @app.post("/run/company-lookup")
@@ -757,6 +795,7 @@ async def run_company_lookup(req: CompanyLookupRequest = CompanyLookupRequest())
     async def gen():
         from db.session import get_session, init_db
         from db.models import Job, CompanyInfo
+        from company_service import enrich_company, normalize_company_name
         init_db()
 
         with get_session() as session:
@@ -764,24 +803,16 @@ async def run_company_lookup(req: CompanyLookupRequest = CompanyLookupRequest())
             if req.min_score > 0:
                 q = q.filter(Job.match_score >= req.min_score)
             all_companies = {row[0] for row in q.all() if row[0]}
-            cached = {
-                row[0] for row in session.query(CompanyInfo.name).all()
-            }
+            cached = {row[0] for row in session.query(CompanyInfo.normalized_name).all() if row[0]}
 
-        todo = sorted(all_companies - cached)
+        todo = sorted(name for name in all_companies
+                      if req.force or normalize_company_name(name) not in cached)
         yield f"Found {len(all_companies)} unique companies, {len(todo)} not yet looked up"
 
         done = 0
         for name in todo:
             try:
-                summary = await _fetch_company_summary(name)
-                with get_session() as session:
-                    existing = session.query(CompanyInfo).filter(CompanyInfo.name == name).first()
-                    if existing:
-                        existing.summary = summary
-                        existing.fetched_at = datetime.utcnow()
-                    else:
-                        session.add(CompanyInfo(name=name, summary=summary))
+                await enrich_company(name, force=req.force)
                 done += 1
                 yield f"✓ {name[:50]}"
             except Exception as e:
@@ -801,6 +832,7 @@ async def run_translate(req: TranslateRequest):
     from db.models import Job
     from db.session import get_session
     from llm.router import call_llm
+    from llm.prompt_manager import render_prompt
 
     with get_session() as session:
         job = session.get(Job, req.job_id)
@@ -812,10 +844,9 @@ async def run_translate(req: TranslateRequest):
         raise HTTPException(400, "No description to translate")
 
     target_name = "English" if req.target == "en" else "Simplified Chinese (中文)"
-    system = (
-        Path(__file__).parent / "llm" / "prompts" / "translation.txt"
-    ).read_text(encoding="utf-8").format(target_name=target_name)
-    text, _ = await call_llm(user=description, system=system, max_tokens=3000, operation="translation")
+    system, user, prompt = render_prompt("translation", target_language=target_name, text=description)
+    text, _ = await call_llm(user=user, system=system, max_tokens=prompt["max_tokens"],
+                             temperature=prompt["temperature"], operation="translation")
     return {"translated": text}
 
 
@@ -840,7 +871,8 @@ async def run_cover(req: CoverRequest):
         session.expunge(job)
 
     cv_text = load_cv_text(direction=req.direction or job.direction or None)
-    letter = await generate_cover_letter(job, cv_text, language=req.language)
+    letter = await generate_cover_letter(job, cv_text, language=req.language,
+                                         role=req.direction or job.direction)
     return {"letter": letter}
 
 
@@ -878,7 +910,7 @@ async def run_tailor_cv(req: TailorCVRequest):
         session.expunge(job)
 
     cv_text = load_cv_text(direction=direction)
-    result = await tailor_cv(job, cv_text, cv_sections=sections)
+    result = await tailor_cv(job, cv_text, cv_sections=sections, role=profile.name if profile else direction)
     result["source_profile_id"] = source_profile_id
     return result
 

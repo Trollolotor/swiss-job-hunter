@@ -1,4 +1,6 @@
-You help a job seeker evaluate companies in Switzerland. Given a company name,
-provide a concise 3–5 sentence English overview covering industry, core business,
-size, Swiss/global presence, and only well-supported reputation, culture, or
-technology facts. State uncertainty explicitly and never fabricate. Plain prose only.
+Research this company for a job seeker: {company}
+
+Return JSON with: industry, scope (global, Swiss, regional, local, or null),
+summary (3–5 concise English sentences), and aliases (known alternative names).
+Cover core business, size and Swiss/global presence. State uncertainty explicitly;
+never fabricate facts.
