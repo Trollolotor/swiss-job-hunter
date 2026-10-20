@@ -1,5 +1,16 @@
-Write reusable synchronous Python defining collect(config, sdk), returning a JSON object matching
-CollectionResult described in the evidence. No imports from the application. sdk.json(url,
+Generate SDK v2 synchronous Python with three functions:
+enumerate(config, sdk) returns a catalogue object: entries (posting_id, variant, detail_url,
+change_token or null, metadata), observed_ids, reported_total, scope, termination and diagnostics.
+Fetch every listing page once, with observed pagination evidence. Each entry must identify a
+real detail link. Never fetch details in enumerate. change_token should reflect listing fields;
+without a dependable update signal use null. The controller decides which details need refresh.
+fetch_detail(config, entry, sdk) fetches detail content using the SDK and returns data plus evidence keys.
+normalize(config, entry, detail) returns a CollectedPosting. It must not perform network access.
+The controller validates and persists sightings; there are no database or CV tools.
+Legacy collect(config,sdk) remains supported for repair of an SDK v1 connector.
+
+The sdk object is passed in: do not import SDK or at_sdk. No sdk.http method exists.
+CollectionResult is described in the evidence. No imports from the application. sdk.json(url,
 method="GET",body=None) returns (parsed JSON, evidence_key). sdk.fetch returns a dict with text,
 url,status,headers,key. sdk.browser(url,actions=[]) returns HTML observations. Use requests only
 through this SDK. No package installs, shell commands, credentials, account actions, applications,

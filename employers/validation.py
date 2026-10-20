@@ -1,7 +1,9 @@
 """Trusted completeness validation. Connector claims are never sufficient."""
 
+import json
 import re
-from urllib.parse import parse_qs, urlsplit
+from datetime import timezone
+from urllib.parse import parse_qs, unquote, urlsplit
 
 from bs4 import BeautifulSoup
 
@@ -14,13 +16,63 @@ def path(value, key):
     return value
 
 
+def complete_description(posting, observations, manifest):
+    """Compare the returned ad with full source fields, not an arbitrary length."""
+    candidates = []
+
+    def extract(value):
+        if isinstance(value, dict):
+            if isinstance(value.get("jobAd"), dict) and isinstance(
+                value["jobAd"].get("sections"), dict
+            ):
+                candidates.append(
+                    " ".join(str(v.get("text", "")) for v in value["jobAd"]["sections"].values())
+                )
+            for key, item in value.items():
+                if key.casefold() in {
+                    "description",
+                    "jobdescription",
+                    "job_description",
+                } and isinstance(item, str):
+                    candidates.append(item)
+                elif isinstance(item, (dict, list)):
+                    extract(item)
+        elif isinstance(value, list):
+            for item in value:
+                extract(item)
+
+    suffix = manifest.get("catalogue", {}).get("path_suffix", "")
+    normalize = lambda value: " ".join(
+        BeautifulSoup(value, "html.parser").get_text(" ", strip=True).split()
+    ).casefold()
+    for observation in observations:
+        if observation.key not in posting.evidence or (
+            suffix and urlsplit(observation.url).path.endswith(suffix)
+        ):
+            continue
+        try:
+            extract(observation.json())
+        except (ValueError, TypeError):
+            soup = BeautifulSoup(observation.text, "html.parser")
+            for script in soup.select('script[type="application/ld+json"]'):
+                try:
+                    extract(json.loads(script.string or ""))
+                except (ValueError, TypeError):
+                    pass
+            selector = manifest.get("detail", {}).get("description_selector")
+            if selector:
+                candidates.extend(str(n) for n in soup.select(selector))
+    expected = normalize(posting.job.description)
+    return bool(expected) and expected in {normalize(text) for text in candidates}
+
+
 def posting_errors(posting, observations):
     """Individually check extracted fields against bytes collected by trusted tools."""
     from employers.network import public_url
 
     errors = []
     job = posting.job
-    if not job.title.strip() or not job.company.strip() or len(job.description.strip()) < 50:
+    if not job.title.strip() or not job.company.strip() or not job.description.strip():
         return ["Missing required vacancy fields"]
     try:
         public_url(job.url)
@@ -52,6 +104,21 @@ def posting_errors(posting, observations):
         except (ValueError, TypeError):
             values.append(obs.text)
     body = normalize(" ".join(values))
+    if not (
+        posting.posting_id in values
+        or any(
+            posting.posting_id == evidence[key].url
+            or posting.posting_id in unquote(urlsplit(evidence[key].url).path)
+            for key in posting.evidence
+            if key in evidence
+        )
+        or any(
+            posting.posting_id in unquote(urlsplit(value).path)
+            for value in values
+            if value.startswith(("https://", "http://"))
+        )
+    ):
+        errors.append("Posting identity is not supported by observed source fields or URLs")
     description_parts = [normalize(part) for part in job.description.split("\n\n") if part.strip()]
     if (
         not body
@@ -79,13 +146,39 @@ def posting_errors(posting, observations):
         not location.raw or normalize(location.raw) in body for location in posting.locations
     ):
         errors.append("Location is not supported by observed source content")
+    if job.posted_at is not None:
+        # Release/update/observation timestamps are deliberately excluded.
+        from analyzer.publication import _json_dates, extract_publication_from_html, publication
+
+        dates = []
+        for key in posting.evidence:
+            if key not in evidence:
+                continue
+            observation = evidence[key]
+            try:
+                dates.extend(publication(raw, "api") for raw in _json_dates(observation.json()))
+            except (ValueError, TypeError):
+                dates.append(extract_publication_from_html(observation.text))
+
+        def utc(value):
+            return (
+                value.replace(tzinfo=timezone.utc)
+                if value.tzinfo is None
+                else value.astimezone(timezone.utc)
+            )
+
+        if not any(
+            date.value and date.source != "relative_text" and utc(date.value) == utc(job.posted_at)
+            for date in dates
+        ):
+            errors.append("Publication date lacks independently observed publication evidence")
     return errors
 
 
 def assess(result: CollectionResult, observations, manifest):
     errors = list(result.diagnostics)
     spec = manifest.get("catalogue", {})
-    pages, observed, totals, cursors = [], [], [], []
+    pages, observed, totals, cursors, reported_totals = [], [], [], [], []
     try:
         for obs in observations:
             if spec.get("rendered", False) != (obs.method == "BROWSER"):
@@ -125,7 +218,31 @@ def assess(result: CollectionResult, observations, manifest):
             pages.append(ids)
             observed.extend(ids)
             if total is not None:
-                totals.append(int(total))
+                if type(total) is not int and not (
+                    isinstance(total, str) and re.fullmatch(r"\d+", total)
+                ):
+                    raise ValueError("Catalogue total must be an integer count")
+                total = int(total)
+                reported_totals.append(total)
+                # Workday CXS supplies a count on offset zero and a zero sentinel
+                # on subsequent nonempty pages. This protocol-specific exception
+                # still requires the initial total to reconcile with every ID.
+                p = urlsplit(obs.url)
+                workday_sentinel = (
+                    spec["format"] == "json"
+                    and obs.method == "POST"
+                    and bool(items)
+                    and total == 0
+                    and int((obs.request_body or {}).get("offset", 0)) > 0
+                    and bool(totals)
+                    and totals[0] > 0
+                    and re.fullmatch(r"[a-z0-9-]+\.wd\d+\.myworkdayjobs\.com", p.hostname or "")
+                    and re.fullmatch(
+                        rf"/wday/cxs/{re.escape(p.hostname.split('.')[0])}/[^/]+/jobs", p.path
+                    )
+                )
+                if not workday_sentinel:
+                    totals.append(total)
             if spec.get("pagination") == "offset":
                 cursor = (
                     (obs.request_body or {}).get("offset")
@@ -177,6 +294,10 @@ def assess(result: CollectionResult, observations, manifest):
         if len(set(identities)) != len(identities):
             errors.append("Duplicate posting variants")
         for posting in result.postings:
+            if manifest.get("contract_version") == "2" and not complete_description(
+                posting, observations, manifest
+            ):
+                errors.append(f"{posting.posting_id}: Complete description field was not extracted")
             errors.extend(
                 f"{posting.posting_id}: {e}" for e in posting_errors(posting, observations)
             )
@@ -185,7 +306,7 @@ def assess(result: CollectionResult, observations, manifest):
         if not observed and not totals:
             errors.append("Empty catalogue lacks affirmative zero-count evidence")
     except (KeyError, TypeError, ValueError, IndexError) as exc:
-        errors.append(f"Observed catalogue schema changed: {type(exc).__name__}")
+        errors.append(f"Observed catalogue schema changed: {type(exc).__name__}: {str(exc)[:200]}")
     valid_postings = bool(result.postings)
     outcome = (
         ("partial" if valid_postings else "failed")
@@ -198,7 +319,8 @@ def assess(result: CollectionResult, observations, manifest):
         "observed_count": len(set(observed)),
         "identities": sorted(p.identity for p in result.postings),
         "evidence_hash": digest([o.key for o in observations]),
-        "validator_version": "1",
+        "validator_version": "2",
+        "catalogue_totals": reported_totals,
     }
 
 

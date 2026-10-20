@@ -10,11 +10,22 @@ from connector_sdk import SDK
 def main():
     payload = json.loads(sys.stdin.readline(256 * 1024))
     scope = {"__name__": "generated_connector"}
-    # Generated stdout belongs to capped stderr, not the tool protocol.
+    sdk = SDK()
+    # The SDK keeps its protocol stream; all generated logging goes to capped stderr.
     with contextlib.redirect_stdout(sys.stderr):
         exec(compile(payload["code"], "<generated-connector>", "exec"), scope)
-    # SDK prints must continue to reach the protocol channel.
-    result = scope["collect"](payload["config"], SDK())
+        if payload.get("sdk_version", "1") == "2":
+            catalogue = scope["enumerate"](payload["config"], sdk)
+            work = sdk._request({"op": "catalogue", "catalogue": catalogue})["entries"]
+            result = {k: v for k, v in catalogue.items() if k != "entries"}
+            result["postings"] = []
+            for entry in work:
+                raw = scope["fetch_detail"](payload["config"], entry, sdk)
+                posting = scope["normalize"](payload["config"], entry, raw)
+                sdk._request({"op": "sighting", "posting": posting})
+                result["postings"].append(posting)
+        else:
+            result = scope["collect"](payload["config"], sdk)
     print(json.dumps({"op": "result", "result": result}), flush=True)
 
 

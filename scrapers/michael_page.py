@@ -10,8 +10,8 @@ from urllib.parse import urlencode
 
 from bs4 import BeautifulSoup
 
-from analyzer.freshness import parse_posted_at
 from scrapers.base import BaseScraper, ScrapedJob
+from analyzer.freshness import parse_posted_at
 
 _BASE_URL = "https://www.michaelpage.ch"
 _SEARCH_URL = f"{_BASE_URL}/jobs"
@@ -23,8 +23,19 @@ class MichaelPageScraper(BaseScraper):
     async def scrape(
         self, keyword: str, location: str = "Zürich", max_pages: int = 5
     ) -> AsyncGenerator[ScrapedJob, None]:
+        """
+        `/jobs?search=<kw>&location=<city>` redirects to the canonical
+        `/jobs/<kw>/<city>` listing, which is what the site's own search box
+        does. `keywords` (what this used to send) is ignored, so every search
+        came back as the unfiltered /jobs feed (#26).
+
+        `page` is 0-based and survives the redirect. Past the last page — and
+        for a search with no hits at all — the site answers 404.
+        """
+        seen: set[str] = set()
+        yielded = 0
         for page in range(max_pages):
-            params: dict = {"keywords": keyword}
+            params: dict = {"search": keyword}
             if location:
                 params["location"] = location
             if page > 0:
@@ -32,22 +43,31 @@ class MichaelPageScraper(BaseScraper):
             url = f"{_SEARCH_URL}?{urlencode(params)}"
 
             try:
-                resp = await self._fetch(url)
+                resp = await self._fetch(url, allow_status={404})
             except Exception as exc:
-                print(f"[michael-page] page {page} error: {exc}")
+                self._page_error(page, exc, yielded)
+                break
+            if resp.status_code == 404:
+                self.end("search_404", empty=not yielded)
                 break
 
             soup = BeautifulSoup(resp.text, "lxml")
+            self.report["pages"] += 1
             items = soup.select(".view-content .views-row")
             if not items:
+                self._page_error(page, ValueError("No listing markup; empty result unverified"), yielded)
                 break
 
+            fresh = 0
             for item in items:
                 job = self._parse_item(item)
-                if job:
+                if job and job.url not in seen:
+                    seen.add(job.url)
+                    fresh += 1
+                    yielded += 1
                     yield job
 
-            if len(items) < 10:
+            if fresh == 0 or len(items) < 10:
                 break
 
     def _parse_item(self, item) -> Optional[ScrapedJob]:
@@ -89,6 +109,7 @@ class MichaelPageScraper(BaseScraper):
                 url=url,
                 source=self.source_name,
                 source_job_id=url,
+                extra={"employer_classification": "agency", "description_quality": "preview"},
                 employment_type=employment_type,
                 posted_at=posted_at,
                 posted_at_source="html" if posted_at and posted_source == "api" else posted_source,
@@ -102,7 +123,7 @@ class MichaelPageScraper(BaseScraper):
         if not job_url or not job_url.startswith("http"):
             return None
         try:
-            resp = await self._fetch(job_url)
+            resp = await self._fetch(job_url, allow_status={404, 410})
             if resp.status_code in (404, 410):
                 return ()  # type: ignore
             soup = BeautifulSoup(resp.text, "lxml")

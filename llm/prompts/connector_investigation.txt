@@ -5,3 +5,8 @@ Return action "fetch" with a relevant URL, "browser" with a public URL, or "gene
 config and manifest describing the catalogue, total, IDs, pagination and detail fields.
 Evidence:
 {evidence}
+
+fetch actions may include method GET or POST and a JSON body. POST is accepted only for
+already verified read-only catalogue endpoints in the source policy. Inspect a listing
+request and at least one detail response before proposing a connector. Capture pagination
+and full description fields. Browser observations include approved request/response examples.

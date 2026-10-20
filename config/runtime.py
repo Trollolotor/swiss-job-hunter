@@ -28,7 +28,7 @@ LLM_OPERATIONS = (
 DEFAULT_LLM_CONFIG: dict[str, Any] = {
     "default_model": "",
     "global_fallbacks": [],
-    "operations": {name: {"model": "", "fallbacks": []} for name in LLM_OPERATIONS},
+    "operations": {name: {"model": "", "fallbacks": [], "reasoning_effort": None} for name in LLM_OPERATIONS},
     "timeout": 120,
     "retries": 1,
     "concurrency": 10,
@@ -155,6 +155,9 @@ def validate_llm_config(value: dict[str, Any]) -> dict[str, Any]:
     config["timeout"] = max(5, min(600, int(config["timeout"])))
     config["retries"] = max(0, min(5, int(config["retries"])))
     config["concurrency"] = max(1, min(50, int(config["concurrency"])))
+    for operation in config["operations"].values():
+        if operation.get("reasoning_effort") not in {None, "", "none", "minimal", "low", "medium", "high", "xhigh", "max"}:
+            raise ValueError("Invalid reasoning effort")
     for model in [config["default_model"], *config.get("global_fallbacks", [])]:
         if not isinstance(model, str) or not model.strip():
             raise ValueError("model slugs must be non-empty strings")

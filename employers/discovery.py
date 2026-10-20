@@ -23,6 +23,8 @@ def board_metadata(job):
         return
     if not isinstance(value, dict):
         return
+    if isinstance(value.get("json_ld"), dict):
+        value = value["json_ld"]
     organization = value.get("hiringOrganization") or value.get("company") or {}
     if not isinstance(organization, dict):
         organization = {}
@@ -126,14 +128,17 @@ def backfill(batch_size=500):
                 posted_at_confidence=job.posted_at_confidence,
             )
             employer = observe(session, scraped, historical=True, observed_at=job.scraped_at)
-            ingest(
-                session,
-                scraped,
-                employer_id=employer.id if employer else None,
-                canonical_id=job.id,
-                historical=True,
-                observed_at=job.scraped_at,
-            )
+            # Some historical rows have neither a posting ID nor a URL. Keep
+            # their employer observation, but do not invent a source identity.
+            if (scraped.source_job_id or "").strip() or (scraped.url or "").strip():
+                ingest(
+                    session,
+                    scraped,
+                    employer_id=employer.id if employer else None,
+                    canonical_id=job.id,
+                    historical=True,
+                    observed_at=job.scraped_at,
+                )
             checkpoint["job_id"] = job.id
         raws = session.scalars(
             select(RawJob)

@@ -5,11 +5,12 @@ import json
 from datetime import datetime
 from typing import TYPE_CHECKING, Literal, Protocol
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from scrapers.base import ScrapedJob
 
 SDK_VERSION = "1"
+LATEST_SDK_VERSION = "2"
 
 if TYPE_CHECKING:
     from employers.network import CollectionContext
@@ -29,6 +30,13 @@ class Location(BaseModel):
     country: str | None = None
     city: str | None = None
     raw: str = ""
+
+    @field_validator("country")
+    @classmethod
+    def country_code(cls, value):
+        if value and value.casefold().strip() in {"switzerland", "schweiz", "suisse", "svizzera", "ch"}:
+            return "CH"
+        return value.upper() if value else None
 
 
 class CollectedPosting(BaseModel):
@@ -52,10 +60,34 @@ class CollectionResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
     postings: list[CollectedPosting] = Field(default_factory=list, max_length=10000)
     observed_ids: list[str] = Field(default_factory=list, max_length=10000)
+    observed_identities: list[str] = Field(default_factory=list, max_length=10000)
     reported_total: int | None = Field(default=None, ge=0)
     scope: str = "all"
     termination: Literal["total", "next_absent", "explicit_empty", "incomplete"] = "incomplete"
     checkpoint: dict = Field(default_factory=dict)
+    diagnostics: list[str] = Field(default_factory=list)
+
+
+class CatalogueEntry(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    posting_id: str = Field(min_length=1, max_length=2000)
+    variant: str = Field(default="", max_length=200)
+    detail_url: str = Field(min_length=1, max_length=2000)
+    change_token: str | None = Field(default=None, max_length=1000)
+    metadata: dict = Field(default_factory=dict)
+
+    @property
+    def identity(self):
+        return json.dumps([self.posting_id, self.variant], separators=(",", ":"))
+
+
+class CatalogueResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    entries: list[CatalogueEntry] = Field(default_factory=list, max_length=10000)
+    observed_ids: list[str] = Field(default_factory=list, max_length=10000)
+    reported_total: int | None = Field(default=None, ge=0)
+    scope: str = "all"
+    termination: Literal["total", "next_absent", "explicit_empty", "incomplete"] = "incomplete"
     diagnostics: list[str] = Field(default_factory=list)
 
 

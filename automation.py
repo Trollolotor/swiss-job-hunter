@@ -186,31 +186,23 @@ async def _execute(run_id: int) -> None:
                 async with scraper_cls(**kwargs) as scraper:
                     for group in search_groups:
                         keyword, location = group["keyword"], group["location"]
-                        async for scraped in scraper.scrape(
-                            keyword, location, config["pages_per_source"]
-                        ):
-                            from employers.discovery import observe_board_result
-                            observe_board_result(scraped)
+                        from scrapers.collection import collect_board
+                        async for scraped, job, created in collect_board(scraper, keyword, location,
+                            config["pages_per_source"], direction=group["profiles"][0][1],
+                            profile_ids=[pid for pid, _ in group["profiles"]],
+                            max_age_days=config["max_age_days"],
+                            include_unknown_dates=config.get("include_unknown_dates", True)):
                             stats["found"] += 1
                             source_stats["found"] += 1
-                            if not scraped.posted_at and not config.get(
-                                "include_unknown_dates", True
-                            ):
-                                continue
-                            if scraped.posted_at:
-                                age = datetime.utcnow() - utc_naive(scraped.posted_at)
-                                if age.total_seconds() > config["max_age_days"] * 86400:
-                                    continue
-                            _first_profile_id, first_slug = group["profiles"][0]
-                            job, created = get_or_create_job(
-                                scraped,
-                                direction=first_slug,
-                                profile_ids=[profile_id for profile_id, _slug in group["profiles"]],
-                            )
                             if created:
                                 new_ids.add(job.id)
                                 stats["new"] += 1
                                 source_stats["new"] += 1
+                        source_stats["outcome"] = scraper.report.get("outcome")
+                        source_stats["run_id"] = scraper.report.get("run_id")
+                        source_stats.setdefault("runs", []).append({"id":scraper.report.get("run_id"),
+                            "outcome":scraper.report.get("outcome"),"keyword":keyword,"location":location})
+                        source_stats["errors"] += len(scraper.report.get("errors", []))
             except Exception:
                 source_stats["errors"] += 1
             finally:
@@ -227,7 +219,8 @@ async def _execute(run_id: int) -> None:
             with get_session() as session:
                 enrich_ids = [row[0] for row in session.query(Job.id).filter(
                     Job.status != JobStatus.ARCHIVED,
-                    or_(Job.description.is_(None), Job.description == "", func.length(Job.description) < 100),
+                    Job.description_quality != "complete",
+                    or_(Job.enrichment_due_at.is_(None), Job.enrichment_due_at <= datetime.utcnow()),
                 ).order_by(Job.last_seen_at.desc()).limit(enrich_limit).all()]
             enriched = await asyncio.gather(*[
                 bounded(_enrich_or_check(job_id, availability=False)) for job_id in enrich_ids
@@ -261,41 +254,25 @@ async def _execute(run_id: int) -> None:
             )
             _update_stats(run_id, stats)
         if config.get("screen"):
-            from analyzer.scorer import llm_score
+            from analyzer.matching import evaluate
+            from analyzer.config import get_config as matching_config
             phase_started = time.monotonic()
             screen_limit = config.get("screen_limit_per_profile", 20)
+            stats["matching_budget_wait"] = not bool(matching_config().daily_budget_usd)
             for profile_id, _slug, name, _location, _keywords, cv_text in profiles:
                 with get_session() as session:
-                    rows = session.query(Job, JobProfile).join(
-                        JobProfile, JobProfile.job_id == Job.id
-                    ).filter(
+                    query = session.query(Job.id).join(JobProfile, JobProfile.job_id == Job.id).filter(
                         JobProfile.profile_id == profile_id,
-                        or_(JobProfile.match_score.is_(None), JobProfile.score_stale.is_(True)),
-                        Job.status != JobStatus.ARCHIVED,
-                        func.length(Job.description) >= 100,
-                    ).order_by(Job.last_seen_at.desc()).limit(screen_limit).all()
-                    payloads = [(j.id, j.title, j.description or "") for j, _link in rows]
-                async def screen_one(job_id, title, description):
-                    if len(description) < 100:
-                        return False
+                        or_(JobProfile.score_method.in_(["pending", "keyword"]), JobProfile.score_stale.is_(True)),
+                        Job.description_quality == "complete")
+                    ids = [r[0] for r in query.order_by(Job.last_seen_at.desc()).limit(screen_limit)]
+                async def screen_one(jid):
                     try:
-                        result = await bounded(llm_score(cv_text, title, description, role=name))
-                        with get_session() as session:
-                            job = session.get(Job, job_id)
-                            if job:
-                                job.match_score, job.match_explanation = result.score, result.explanation
-                                set_scored_status(job, JobStatus.SHORTLISTED if result.score >= .3 else JobStatus.ANALYZED)
-                                link = session.get(JobProfile, (job_id, profile_id))
-                                if link:
-                                    link.match_score, link.match_explanation = result.score, result.explanation
-                                    link.screened_at = datetime.utcnow()
-                                    from employers.ingestion import mark_scores_fresh
-                                    mark_scores_fresh(session, job_id, profile_id)
-                        return True
+                        result = await bounded(evaluate(jid, profile_id, llm=not stats["matching_budget_wait"]))
+                        return result["state"] == "scored"
                     except Exception:
                         return False
-                screened = await asyncio.gather(*[screen_one(*payload) for payload in payloads]) if payloads else []
-                stats["screened"] += sum(screened)
+                stats["screened"] += sum(await asyncio.gather(*[screen_one(jid) for jid in ids]))
             stats["phase_seconds"]["screen"] = round(time.monotonic() - phase_started, 2)
             _update_stats(run_id, stats)
         if config.get("company_enrichment"):
@@ -354,7 +331,9 @@ async def _execute(run_id: int) -> None:
         stats["date_coverage"] = {k: {"known": v[0], "total": v[1],
                                                "percent": round(v[0] / v[1] * 100, 1) if v[1] else 0}
                                   for k, v in coverage.items()}
-        _finish(run_id, "completed", stats)
+        partial = any(v.get("errors") or any(r["outcome"] in {"partial", "failed"}
+            for r in v.get("runs", [])) for v in stats["sources"].values())
+        _finish(run_id, "partial" if partial else "completed", stats)
     except asyncio.CancelledError:
         _finish(run_id, "failed", stats, "automation run cancelled during shutdown")
         raise
@@ -372,61 +351,8 @@ def _update_stats(run_id: int, stats: dict) -> None:
 
 
 async def _enrich_or_check(job_id: int, availability: bool) -> bool:
-    import importlib
-    from analyzer.publication import extract_publication_from_html
-    from db.models import Job
-    from db.session import get_session
-    scraper_map = {
-        "jobs.ch": "scrapers.jobs_ch.JobsChScraper", "jobscout24.ch": "scrapers.jobscout24.JobScout24Scraper",
-        "swissdevjobs.ch": "scrapers.swissdevjobs.SwissDevJobsScraper", "züri.jobs": "scrapers.zuri_jobs.ZuriJobsScraper",
-        "efinancialcareers.ch": "scrapers.efinancialcareers.EFinancialCareersScraper", "jobup.ch": "scrapers.jobup_ch.JobupChScraper",
-        "linkedin.com": "scrapers.linkedin_rss.LinkedInRssScraper", "michael-page.ch": "scrapers.michael_page.MichaelPageScraper",
-        "indeed.ch": "scrapers.indeed_ch.IndeedChScraper",
-    }
-    with get_session() as session:
-        job = session.get(Job, job_id)
-        if not job or job.source not in scraper_map:
-            return False
-        source, identifier, url = job.source, job.source_job_id or job.url, job.url
-        needs_date = not bool(job.posted_at)
-        if identifier and identifier.isdigit():
-            identifier = url
-    path = scraper_map[source]
-    module, cls = path.rsplit(".", 1)
-    try:
-        async with getattr(importlib.import_module(module), cls)() as scraper:
-            fetcher = getattr(scraper, "fetch_full_description", None)
-            result = await fetcher(identifier) if fetcher else None
-            published = None
-            if needs_date:
-                try:
-                    response = await scraper._fetch(url)
-                    published = extract_publication_from_html(response.text)
-                except Exception:
-                    pass
-    except Exception:
-        return False
-    with get_session() as session:
-        job = session.get(Job, job_id)
-        if not job:
-            return False
-        job.availability_checked_at = datetime.utcnow()
-        if result == ():
-            from job_lifecycle import mark_unavailable
-            mark_unavailable(job, "source returned 404/410 or explicit closure")
-            return False
-        if result:
-            from job_lifecycle import mark_available
-            mark_available(job)
-            from employers.ingestion import board_may_enrich
-            if len(result[0]) > 100 and board_may_enrich(session, job.id):
-                job.description = result[0]
-            if result[1]:
-                job.url = result[1]
-        if published and published.value and (not job.posted_at or published.confidence > (job.posted_at_confidence or 0)):
-            job.posted_at, job.posted_at_source = published.value, published.source
-            job.posted_at_raw, job.posted_at_confidence = published.raw, published.confidence
-    return bool(result)
+    from analyzer.enrichment import enrich
+    return await enrich(job_id, availability=availability)
 
 
 def _finish(run_id: int, status: str, stats: dict, error: str | None = None) -> None:

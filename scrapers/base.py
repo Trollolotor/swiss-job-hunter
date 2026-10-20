@@ -11,9 +11,14 @@ from datetime import datetime
 from typing import AsyncGenerator, Optional
 
 import httpx
-from tenacity import retry, stop_after_attempt, wait_exponential
 
 from config.settings import settings
+
+
+class PermanentHTTPError(httpx.HTTPStatusError):
+    @property
+    def status_code(self):
+        return self.response.status_code
 
 
 @dataclass
@@ -63,6 +68,16 @@ class BaseScraper(ABC):
 
     def __init__(self) -> None:
         self._client: Optional[httpx.AsyncClient] = None
+        self.report = {"requests": 0, "pages": 0, "errors": [], "termination": None}
+
+    def end(self, reason, *, empty=False):
+        self.report["termination"] = reason
+        self.report["verified_empty"] = empty
+
+    def _page_error(self, page, exc, yielded=0):
+        self.report["errors"].append(f"page {page}: {type(exc).__name__}: {exc}"[:500])
+        if not yielded:
+            raise exc
 
     @property
     @abstractmethod
@@ -95,17 +110,30 @@ class BaseScraper(ABC):
             )
         return self._client
 
-    @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=2, max=10),
-        reraise=True,
-    )
-    async def _fetch(self, url: str, **kwargs) -> httpx.Response:  # type: ignore[override]
+    async def _fetch(self, url: str, *, allow_status=None, **kwargs) -> httpx.Response:
         client = await self._get_client()
-        await self._polite_delay()
-        response = await client.get(url, **kwargs)
-        response.raise_for_status()
-        return response
+        for attempt in range(3):
+            await self._polite_delay()
+            self.report["requests"] += 1
+            try:
+                response = await client.get(url, **kwargs)
+                self.last_response = response
+                self.report["last_status"] = response.status_code
+                if response.status_code in (allow_status or set()):
+                    return response
+                if 400 <= response.status_code < 500 and response.status_code != 429:
+                    raise PermanentHTTPError(f"HTTP {response.status_code}: {url}",
+                                             request=response.request, response=response)
+                response.raise_for_status()
+                return response
+            except PermanentHTTPError as exc:
+                self.report["errors"].append(str(exc)[:500])
+                raise
+            except (httpx.TransportError, httpx.HTTPStatusError) as exc:
+                if attempt == 2:
+                    self.report["errors"].append(str(exc)[:500])
+                    raise
+                await asyncio.sleep(2 ** attempt)
 
     async def _polite_delay(self) -> None:
         """Random delay to avoid hammering servers."""

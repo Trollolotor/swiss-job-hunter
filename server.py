@@ -19,7 +19,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 from fastapi import FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import func
 
 from config.settings import settings
@@ -91,18 +91,22 @@ def get_jobs_query(
     status: str = "all", q: str = "", direction: str = "all", min_stars: int = 0,
     profile_id: Optional[int] = None, published_within: Optional[int] = None,
     sort: str = "priority", include_unknown_dates: bool = True,
+    direct_only: bool = False, review_queue: bool = False, min_score: float = 0.0,
 ):
     from employers.ingestion import job_source_fields
     from analyzer.freshness import freshness, priority, utc_naive
     from config.runtime import get_priority_config
     from db.session import get_session
-    from db.models import Job, SearchProfile, CompanyInfo, JobProfile
+    from db.models import Job, JobStatus, SearchProfile, CompanyInfo, JobProfile
     from company_service import company_dict, normalize_company_name
     from sqlalchemy import or_
+    from sqlalchemy.orm import selectinload
 
     config = get_priority_config()
+    from analyzer.matching import aggregate
     with get_session() as session:
-        query = session.query(Job)
+        query = session.query(Job).options(selectinload(Job.profiles).load_only(
+            SearchProfile.id, SearchProfile.slug, SearchProfile.name))
         if status != "all":
             query = query.filter(Job.status == status)
         if profile_id:
@@ -121,9 +125,14 @@ def get_jobs_query(
             query = query.filter(Job.user_stars >= min_stars)
         jobs = query.all()
         profile_matches = {}
-        if profile_id:
-            profile_matches = {row.job_id: row for row in session.query(JobProfile).filter_by(
-                profile_id=profile_id).all()}
+        for row in session.query(JobProfile).join(SearchProfile, SearchProfile.id == JobProfile.profile_id).filter(
+            JobProfile.job_id.in_([j.id for j in jobs]),
+            (SearchProfile.active.is_(True) if not profile_id and direction in ("all", "", None) else True)):
+            profile_matches.setdefault(row.job_id, []).append(row)
+        selected_profile_id = profile_id
+        if not selected_profile_id and direction not in ("all", "", None):
+            selected_profile = session.query(SearchProfile).filter_by(slug=direction).first()
+            selected_profile_id = selected_profile.id if selected_profile else None
         company_rows = session.query(CompanyInfo).all()
         companies = {row.normalized_name or normalize_company_name(row.name): company_dict(row)
                      for row in company_rows}
@@ -139,17 +148,30 @@ def get_jobs_query(
                     continue
                 if age_days is not None and age_days > published_within:
                     continue
-            profile_match = profile_matches.get(j.id)
-            match_score = profile_match.match_score if profile_match and profile_match.match_score is not None else j.match_score
-            match_explanation = profile_match.match_explanation if profile_match and profile_match.match_explanation else j.match_explanation
+            evaluation = aggregate(j, profile_matches.get(j.id, []), selected_profile_id)
+            match_score = evaluation["match_score"]
+            provenance = job_source_fields(session, j.id, source_rows.get(j.id, []))
+            if direct_only and not provenance["direct_only"]:
+                continue
+            if review_queue and (j.expired_at or j.status not in {
+                JobStatus.NEW, JobStatus.ANALYZED, JobStatus.SHORTLISTED, JobStatus.VIEWED}):
+                continue
+            if min_score and (match_score is None or match_score < min_score):
+                continue
             records.append({
-                **job_source_fields(session, j.id, source_rows.get(j.id, [])),
+                **provenance,
+                **evaluation,
+                "description_quality": j.description_quality,
+                "extraction": json.loads(j.extraction_json or "{}"),
+                "status_origin": j.status_origin,
+                "matching_profile": next(({"id": p.id, "name": p.name} for p in j.profiles
+                    if p.id == evaluation["matching_profile_id"]), None),
                 "id": j.id, "title": j.title, "company": j.company,
                 "location": j.location, "description": j.description, "url": j.url,
                 "source": j.source, "source_job_id": j.source_job_id,
                 "salary_raw": j.salary_raw, "employment_type": j.employment_type,
                 "status": j.status, "match_score": match_score,
-                "match_explanation": match_explanation, "user_stars": j.user_stars,
+                "match_explanation": evaluation["match_explanation"], "user_stars": j.user_stars,
                 "direction": j.direction,
                 "company_info": companies.get(normalize_company_name(j.company)),
                 "profiles": [{"id": p.id, "slug": p.slug, "name": p.name} for p in j.profiles],
@@ -165,7 +187,7 @@ def get_jobs_query(
                 "expired_reason": j.expired_reason,
                 "freshness_score": fresh_score, "age_label": age_label,
                 "age_days": age_days,
-                "priority_score": priority(match_score, fresh_score, config),
+                "priority_score": priority(match_score if match_score is not None else evaluation["keyword_score"], fresh_score, config),
                 "priority_match_weight": config["match_weight"],
                 "priority_freshness_weight": config["freshness_weight"],
             })
@@ -189,44 +211,41 @@ def list_jobs(
     status: str = "all", q: str = "", direction: str = "all", min_stars: int = 0,
     profile_id: Optional[int] = None, published_within: str = "",
     sort: str = "priority", include_unknown_dates: bool = True,
+    direct_only: bool = False, review_queue: bool = False, min_score: float = 0.0,
 ):
-    from db.session import init_db
+    from db.session import init_db, get_session
+    from analyzer.matching import resolve_profiles, ProfileSelectionError
     init_db()
-    days = int(published_within) if published_within.strip() else None
+    if profile_id is not None or direction not in ("all", "", None):
+        with get_session() as session:
+            try:
+                resolve_profiles(session, profile_id, direction, require_cv=False)
+            except ProfileSelectionError as exc:
+                raise HTTPException(422, str(exc)) from exc
+    try:
+        days = int(published_within) if published_within.strip() else None
+    except ValueError as exc:
+        raise HTTPException(422, "published_within must be a number of days") from exc
     return get_jobs_query(status, q, direction, min_stars, profile_id, days, sort,
-                          include_unknown_dates)
+                          include_unknown_dates, direct_only, review_queue, min_score)
 
 
 @app.get("/stats")
-def get_stats(threshold: float = 0.1):
-    from db.session import get_session, init_db
-    from db.models import Job
-    init_db()
-    with get_session() as session:
-        total = session.query(func.count(Job.id)).scalar() or 0
-        by_status = dict(
-            session.query(Job.status, func.count(Job.id)).group_by(Job.status).all()
-        )
-        by_source = dict(
-            session.query(Job.source, func.count(Job.id)).group_by(Job.source).all()
-        )
-        avg_score = session.query(func.avg(Job.match_score)).filter(
-            Job.match_score.isnot(None)
-        ).scalar()
-        top_score = session.query(func.max(Job.match_score)).scalar()
-        above_threshold = session.query(func.count(Job.id)).filter(
-            Job.match_score >= threshold
-        ).scalar() or 0
-
-    return {
-        "total": total,
-        "by_status": by_status,
-        "by_source": by_source,
-        "avg_score": float(avg_score) if avg_score else None,
-        "top_score": float(top_score) if top_score else None,
-        "above_threshold": above_threshold,
-        "threshold": threshold,
-    }
+def get_stats(threshold: float = 0.1, profile_id: Optional[int] = None, direction: str = "all",
+              status: str = "all", q: str = "", direct_only: bool = False,
+              review_queue: bool = False, min_stars: int = 0, published_within: str = "",
+              include_unknown_dates: bool = True, min_score: float = 0):
+    from collections import Counter
+    records = list_jobs(status=status, q=q, profile_id=profile_id, direction=direction,
+                        direct_only=direct_only, review_queue=review_queue, min_stars=min_stars,
+                        published_within=published_within, include_unknown_dates=include_unknown_dates,
+                        min_score=min_score)
+    scores = [r["match_score"] for r in records if r["match_score"] is not None]
+    return {"total": len(records), "by_status": dict(Counter(r["status"] for r in records)),
+            "by_source": dict(Counter(r["source"] for r in records)),
+            "avg_score": sum(scores) / len(scores) if scores else None,
+            "top_score": max(scores) if scores else None,
+            "above_threshold": sum(v >= threshold for v in scores), "threshold": threshold}
 
 
 @app.delete("/jobs/{job_id}")
@@ -272,7 +291,8 @@ def update_status(job_id: int, body: dict):
         job = session.get(Job, job_id)
         if not job:
             raise HTTPException(404, "Job not found")
-        job.status = s
+        from job_lifecycle import transition
+        transition(job, s, origin="user", reason=body.get("reason") or "Manual review")
     return {"ok": True}
 
 
@@ -316,410 +336,142 @@ class SearchRequest(BaseModel):
 
 @app.post("/run/search")
 async def run_search(req: SearchRequest):
+    from analyzer.matching import resolve_profiles, ProfileSelectionError
+    from db.session import get_session, init_db
+    init_db()
+    with get_session() as session:
+        try:
+            selected = resolve_profiles(session, req.profile_id, req.direction, require_cv=False, allow_empty=True)
+            profile_ids = [p.id for p in selected]
+            active_direction = selected[0].slug if len(selected) == 1 else None
+        except ProfileSelectionError as exc:
+            raise HTTPException(422, str(exc)) from exc
+
     async def gen():
         from scrapers import SCRAPER_REGISTRY
-        from dedup.exact import get_or_create_job, is_exact_duplicate
-        from db import init_db
-        from db.models import RawJob
-        from db.session import get_session
-        init_db()
-        active_direction = req.direction
-        profile_keywords: list[str] = []
-        if req.profile_id:
-            from db.models import SearchProfile
-            with get_session() as session:
-                profile = session.get(SearchProfile, req.profile_id)
-                if not profile:
-                    yield "✗ Search profile not found"
-                    return
-                active_direction = profile.slug
-                try:
-                    profile_keywords = json.loads(profile.keywords_json)
-                except json.JSONDecodeError:
-                    profile_keywords = []
-
-
-        kw_list = req.keywords if req.keywords else [req.keyword]
+        from scrapers.collection import collect_board
         total_new = 0
-        linkedin_in_sources = "linkedin.com" in req.sources
-
-        for kw_idx, kw in enumerate(kw_list):
-            if kw_idx > 0 and linkedin_in_sources:
-                yield f"⏳ LinkedIn cooldown 5s..."
-                await asyncio.sleep(5)
-            yield f"─── keyword: {kw} · {req.location or 'Switzerland (all)'}"
-
+        for keyword in req.keywords or [req.keyword]:
             for source_name in req.sources:
-                scraper_cls = SCRAPER_REGISTRY.get(source_name)
-                if not scraper_cls:
+                cls = SCRAPER_REGISTRY.get(source_name)
+                if not cls:
                     yield f"✗ Unknown source: {source_name}"
                     continue
-
-                yield f"→ {source_name}"
-                new_count = 0
-                found_count = 0
-                try:
-                    kwargs = {}
-                    if source_name == "linkedin.com":
-                        kwargs["time_range"] = req.linkedin_time_range
-                        kwargs["experience_level"] = req.linkedin_experience_level
-                    async with scraper_cls(**kwargs) as scraper:
-                        async for scraped in scraper.scrape(kw, req.location, req.pages):
-                            from employers.discovery import observe_board_result
-                            observe_board_result(scraped)
-                            found_count += 1
-                            if req.max_age_days is not None:
-                                if not scraped.posted_at and not req.include_unknown_dates:
-                                    continue
-                                if scraped.posted_at:
-                                    from analyzer.freshness import utc_naive
-                                    age = datetime.utcnow() - utc_naive(scraped.posted_at)
-                                    if age.total_seconds() > req.max_age_days * 86400:
-                                        continue
-                            if found_count % 10 == 0:
-                                yield f"  ↳ {source_name}: {found_count} fetched so far..."
-                            try:
-                                job, created = get_or_create_job(scraped, direction=active_direction or None)
-                                if created:
-                                    try:
-                                        with get_session() as session:
-                                            raw = RawJob(
-                                                canonical_id=job.id,
-                                                source=scraped.source,
-                                                source_job_id=scraped.source_job_id,
-                                                url=scraped.url,
-                                                raw_html=scraped.raw_html,
-                                                raw_json=scraped.raw_json,
-                                            )
-                                            session.add(raw)
-                                    except Exception:
-                                        pass
-                                    new_count += 1
-                                    yield f"  + [{source_name}] {scraped.title[:50]} @ {scraped.company}"
-                            except Exception as e:
-                                yield f"  ✗ skipped one job: {str(e)[:80]}"
-                                continue
-                except Exception as e:
-                    total_new += new_count
-                    partial = f", saved {new_count} before failure" if new_count else ""
-                    yield f"✗ {source_name} failed{partial}: {str(e)[:120]}"
-                    continue
-
-                if found_count == 0:
-                    yield f"✓ {source_name}: +0 new jobs (scraper returned 0 results)"
-                elif new_count == 0:
-                    yield f"✓ {source_name}: +0 new jobs ({found_count} found, all duplicates)"
-                else:
-                    yield f"✓ {source_name}: +{new_count} new jobs"
-                total_new += new_count
-
-        yield f"✓ Done — {total_new} total new jobs"
+                kwargs = {"time_range": req.linkedin_time_range,
+                          "experience_level": req.linkedin_experience_level} if source_name == "linkedin.com" else {}
+                yield f"→ {source_name}: {keyword} · {req.location}"
+                async with cls(**kwargs) as scraper:
+                    try:
+                        async for scraped, job, created in collect_board(scraper, keyword, req.location,
+                            req.pages, direction=active_direction, profile_ids=profile_ids,
+                            max_age_days=req.max_age_days, include_unknown_dates=req.include_unknown_dates):
+                            if created:
+                                total_new += 1
+                                yield f"  + #{job.id} {scraped.title[:70]} @ {scraped.company}"
+                    except Exception as exc:
+                        yield f"✗ {source_name}: {str(exc)[:200]}"
+                    yield "RUN " + json.dumps({"source": source_name, **scraper.report})
+        yield f"✓ Found {total_new} new jobs"
     return await sse(gen())
 
 
 class EnrichRequest(BaseModel):
-    limit: int = 50
+    limit: int = Field(default=50, ge=1, le=20000)
     source: str = "jobs.ch"
     rescore_llm: bool = False
     direction: Optional[str] = None
+    profile_id: int | None = None
     check_availability: bool = False
 
 
 @app.post("/run/enrich")
 async def run_enrich(req: EnrichRequest):
-    async def gen():
-        from db.models import Job
-        from db.session import get_session
-        with get_session() as session:
-            query = session.query(Job).filter(Job.source == req.source)
-            if not req.check_availability:
-                query = query.filter(
-                    (Job.description == None) | (Job.description == "") |  # noqa: E711
-                    (func.length(Job.description) < 100)
-                )
-            jobs = query.order_by(Job.scraped_at.desc()).limit(req.limit).all()
-            import re as _re
-            job_data = []
-            for j in jobs:
-                dlen = len(j.description or "")
-                # Resolve the identifier to pass to fetch_full_description:
-                # - UUID source_job_id → pass as-is (jobs.ch style)
-                # - URL source_job_id → pass as-is (züri.jobs new records)
-                # - purely numeric source_job_id → substitute j.url (züri.jobs old,
-                #   efinancialcareers, linkedin store numeric IDs that need the full URL)
-                # - slug source_job_id → pass as-is (swissdevjobs)
-                # - no source_job_id → extract UUID from URL, else use URL
-                sjid = j.source_job_id
-                _uuid_re = r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
-                if sjid and sjid.isdigit() and j.url:
-                    sjid = j.url
-                elif not sjid and j.url:
-                    m = _re.search(r'/detail/([a-f0-9-]{36})', j.url)
-                    sjid = m.group(1) if m else j.url
-                if sjid:
-                    job_data.append((j.id, sjid, dlen, j.url))
-
-        to_enrich = [(jid, sjid, url) for jid, sjid, dlen, url in job_data
-                     if dlen < 100 or req.check_availability]
-        yield f"Enriching {len(to_enrich)} jobs from {req.source}..."
-
-        # Generic enrich — works for any scraper that implements fetch_full_description
-        scraper_map = {
-            "jobs.ch": "scrapers.jobs_ch.JobsChScraper",
-            "jobscout24.ch": "scrapers.jobscout24.JobScout24Scraper",
-            "swissdevjobs.ch": "scrapers.swissdevjobs.SwissDevJobsScraper",
-            "züri.jobs": "scrapers.zuri_jobs.ZuriJobsScraper",
-            "efinancialcareers.ch": "scrapers.efinancialcareers.EFinancialCareersScraper",
-            "jobup.ch": "scrapers.jobup_ch.JobupChScraper",
-            "linkedin.com": "scrapers.linkedin_rss.LinkedInRssScraper",
-            "michael-page.ch": "scrapers.michael_page.MichaelPageScraper",
-        }
-
-        scraper_path = scraper_map.get(req.source)
-        if not scraper_path:
-            yield f"– Enrich not yet implemented for {req.source}"
-            return
-
-        module_path, cls_name = scraper_path.rsplit(".", 1)
-        import importlib
-        module = importlib.import_module(module_path)
-        scraper_cls = getattr(module, cls_name)
-
-        updated = 0
-        enriched_ids = []
+    from analyzer.matching import resolve_profiles, ProfileSelectionError, evaluate
+    from analyzer.enrichment import enrich
+    from analyzer.quality import needs_enrichment
+    from db.models import Job
+    from db.session import get_session
+    with get_session() as session:
         try:
-            async with scraper_cls() as scraper:
-                for job_id, source_job_id, job_url in to_enrich:
-                    try:
-                        result = await scraper.fetch_full_description(source_job_id)
-                        if result and len(result) == 2 and len(result[0]) > 100:
-                            desc, canonical_url = result
-                            with get_session() as session:
-                                job = session.get(Job, job_id)
-                                if job:
-                                    from employers.ingestion import board_may_enrich
-                                    if board_may_enrich(session, job.id):
-                                        job.description = desc
-                                    if canonical_url:
-                                        job.url = canonical_url
-                                    from job_lifecycle import mark_available
-                                    mark_available(job)
-                            try:
-                                from analyzer.publication import extract_publication_from_html
-                                detail_response = await scraper._fetch(canonical_url or job_url)
-                                published = extract_publication_from_html(detail_response.text)
-                                if published.value:
-                                    with get_session() as session:
-                                        job = session.get(Job, job_id)
-                                        if job and (not job.posted_at or published.confidence > (job.posted_at_confidence or 0)):
-                                            job.posted_at = published.value
-                                            job.posted_at_source = published.source
-                                            job.posted_at_raw = published.raw
-                                            job.posted_at_confidence = published.confidence
-                            except Exception:
-                                pass
-                            updated += 1
-                            enriched_ids.append(job_id)
-                            yield f"✓ job #{job_id} — {len(desc)} chars"
-                        elif result == ():
-                            with get_session() as session:
-                                job = session.get(Job, job_id)
-                                if job:
-                                    from job_lifecycle import mark_unavailable
-                                    mark_unavailable(job, "source returned 404/410 or explicit closure")
-                            yield f"– job #{job_id} — unavailable confirmation recorded"
-                        else:
-                            yield f"– job #{job_id} — no detail available"
-                    except Exception as e:
-                        yield f"✗ job #{job_id} error: {str(e)[:80]}"
-        except Exception as e:
-            yield f"✗ Enrich failed: {str(e)[:120]}"
-        yield f"✓ Enriched {updated}/{len(to_enrich)} jobs"
-
-        if req.rescore_llm and enriched_ids:
-            from analyzer.scorer import llm_score, load_cv_text
-            from db.models import JobStatus
-            yield f"→ LLM scoring {len(enriched_ids)} newly enriched jobs..."
+            pids = [p.id for p in resolve_profiles(session, req.profile_id, req.direction)] if req.rescore_llm else []
+        except ProfileSelectionError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        jobs = session.query(Job).filter_by(source=req.source).order_by(Job.scraped_at.desc()).all()
+        ids = [j.id for j in jobs if req.check_availability or needs_enrichment(j)][:req.limit]
+    async def gen():
+        yield f"Enriching {len(ids)} vacancies"
+        for jid in ids:
             try:
-                cv_text = load_cv_text(direction=req.direction or None)
-            except FileNotFoundError as e:
-                yield f"✗ CV not found: {e}"
-                return
-            scored = 0
-            for job_id in enriched_ids:
-                try:
-                    with get_session() as session:
-                        job = session.get(Job, job_id)
-                        if not job:
-                            continue
-                        if job.match_score is not None:
-                            continue  # already scored, skip
-                        title, desc = job.title, job.description or ""
-                    result = await llm_score(cv_text, title, desc, role=req.direction or "General")
-                    with get_session() as session:
-                        job = session.get(Job, job_id)
-                        if job:
-                            job.match_score = result.score
-                            if result.score < 0.1:
-                                set_scored_status(job, JobStatus.ARCHIVED)
-                            elif result.score >= 0.6:
-                                set_scored_status(job, JobStatus.SHORTLISTED)
-                    scored += 1
-                    yield f"  🧠 job #{job_id} — {round(result.score * 100)}%"
-                except Exception as e:
-                    yield f"  ✗ job #{job_id} score error: {str(e)[:80]}"
-            yield f"✓ LLM scored {scored}/{len(enriched_ids)} jobs"
+                complete = await enrich(jid, availability=req.check_availability)
+                yield f"#{jid}: {'complete description' if complete else 'incomplete/closed; recovery state retained'}"
+                if complete:
+                    for pid in pids:
+                        result = await evaluate(jid, pid, llm=True)
+                        yield json.dumps({"job_id": jid, "profile_id": pid, **result})
+            except Exception as exc:
+                yield f"✗ #{jid}: {str(exc)[:200]}"
     return await sse(gen())
 
 
 class AnalyzeRequest(BaseModel):
-    limit: int = 100
+    limit: int = Field(default=100, ge=1, le=20000)
     llm: bool = False
-    min_score: float = 0.3
+    min_score: float | None = Field(default=None, ge=0, le=1)
     skip_scored: bool = True
-    archive_below: float = 0.1  # auto-archive jobs scoring below this (LLM mode only)
-    min_keyword_score: float = 0.05  # skip LLM if keyword pre-filter score < this
+    archive_below: float | None = Field(default=None, ge=0, le=1)
+    min_keyword_score: float = 0.0  # compatibility only: keyword estimates never reject
     direction: Optional[str] = None
-    concurrency: int = 10
+    profile_id: int | None = None
+    concurrency: int | None = Field(default=None, ge=1, le=20)
 
 
 @app.post("/run/analyze")
 async def run_analyze(req: AnalyzeRequest):
-    async def gen():
-        import asyncio
-        from asyncio import Queue
-        from analyzer.scorer import fast_score, llm_score, load_cv_text, load_cv_keywords
-        from db.models import Job, JobProfile, JobStatus, SearchProfile
-        from db.session import get_session
-        from sqlalchemy import or_
-
+    from analyzer.matching import resolve_profiles, ProfileSelectionError, evaluate
+    from analyzer.config import get_config
+    from db.models import Job, JobProfile
+    from db.session import get_session, init_db
+    init_db()
+    config = get_config()
+    if req.min_score is not None and req.archive_below is not None and req.archive_below > req.min_score:
+        raise HTTPException(422, "archive threshold must not exceed shortlist threshold")
+    with get_session() as session:
         try:
-            cv_text = load_cv_text(direction=req.direction or None)
-        except FileNotFoundError as e:
-            yield f"✗ {e}"
-            return
+            profile_ids = [p.id for p in resolve_profiles(session, req.profile_id, req.direction)]
+        except ProfileSelectionError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        jobs = session.query(Job).order_by(Job.scraped_at.desc()).limit(req.limit).all()
+        payloads = []
+        for job in jobs:
+            for pid in profile_ids:
+                link = session.get(JobProfile, (job.id, pid))
+                if req.skip_scored and link and link.score_method == "llm" and not link.score_stale:
+                    continue
+                payloads.append((job.id, pid))
 
-        with get_session() as session:
-            scoring_profile = session.query(SearchProfile).filter_by(slug=req.direction).first() if req.direction else None
-            scoring_profile_id = scoring_profile.id if scoring_profile else None
-            statuses = list(JobStatus)  # all statuses when rescoring
-            if req.skip_scored:
-                statuses = [JobStatus.NEW, JobStatus.ANALYZED, JobStatus.SHORTLISTED, JobStatus.VIEWED, JobStatus.CONSIDERING]
-            query = session.query(Job).filter(Job.status.in_(statuses))
-            if req.direction:
-                query = query.filter(or_(Job.direction == req.direction, Job.profiles.any(SearchProfile.slug == req.direction)))
-            if req.skip_scored:
-                stale_ids = session.query(JobProfile.job_id).filter(JobProfile.score_stale.is_(True))
-                if scoring_profile_id:
-                    stale_ids = stale_ids.filter(JobProfile.profile_id == scoring_profile_id)
-                query = query.filter(or_(Job.match_score.is_(None), Job.id.in_(stale_ids)))
-            lim = req.limit if req.skip_scored else 9999
-            jobs = query.order_by(Job.scraped_at.desc()).limit(lim).all()
-            job_data = [(j.id, j.title, j.description) for j in jobs]
-
-        threshold = req.min_score if not req.llm else min(req.min_score, 0.2)
-        yield f"Analyzing {len(job_data)} jobs (mode: {'LLM' if req.llm else 'keyword'}, concurrency: {req.concurrency if req.llm else 1})..."
-        if not job_data:
-            yield "✓ Nothing to score"
-            return
-        shortlisted = 0
-
-        if req.llm:
-            # Load dynamic CV keywords once for pre-filter (cached per CV file)
-            yield f"→ Loading CV keywords for pre-filter..."
-            cv_keywords = await load_cv_keywords(cv_text, direction=req.direction or None)
-            yield f"→ Loaded {len(cv_keywords)} keywords, pre-filter threshold: {req.min_keyword_score:.0%}"
-
-            queue: Queue = Queue()
-            sem = asyncio.Semaphore(req.concurrency)
-            completed = 0
-            skipped = 0
-            total = len(job_data)
-
-            async def score_one(job_id: int, title: str, description: str) -> None:
-                nonlocal shortlisted, completed, skipped
-                async with sem:
-                    try:
-                        # Keyword pre-filter: skip LLM if clearly irrelevant
-                        kw_result = fast_score(cv_text, description or "", compiled=cv_keywords)
-                        if kw_result.score < req.min_keyword_score:
-                            with get_session() as session:
-                                job = session.get(Job, job_id)
-                                if job:
-                                    job.match_score = kw_result.score
-                                    job.match_explanation = f"[keyword pre-filter] {kw_result.explanation}"
-                                    set_scored_status(job, JobStatus.ARCHIVED)
-                                    link = session.get(JobProfile, (job_id, scoring_profile_id)) if scoring_profile_id else None
-                                    if link:
-                                        link.match_score, link.match_explanation = job.match_score, job.match_explanation
-                                        link.screened_at = datetime.utcnow()
-                                        from employers.ingestion import mark_scores_fresh
-                                        mark_scores_fresh(session, job_id, scoring_profile_id)
-                            skipped += 1
-                            await queue.put(f"– #{job_id} {kw_result.score:.0%} (skipped) — {title[:45]}")
-                        else:
-                            result = await llm_score(cv_text, title, description or "", role=req.direction or "General")
-                            with get_session() as session:
-                                job = session.get(Job, job_id)
-                                if job:
-                                    job.match_score = result.score
-                                    job.match_explanation = result.explanation
-                                    link = session.get(JobProfile, (job_id, scoring_profile_id)) if scoring_profile_id else None
-                                    if link:
-                                        link.match_score, link.match_explanation = result.score, result.explanation
-                                        link.screened_at = datetime.utcnow()
-                                        from employers.ingestion import mark_scores_fresh
-                                        mark_scores_fresh(session, job_id, scoring_profile_id)
-                                    if result.score >= threshold:
-                                        set_scored_status(job, JobStatus.SHORTLISTED)
-                                        shortlisted += 1
-                                    elif result.score < req.archive_below:
-                                        set_scored_status(job, JobStatus.ARCHIVED)
-                                    else:
-                                        set_scored_status(job, JobStatus.ANALYZED)
-                            score_pct = f"{result.score:.0%}"
-                            icon = "⭐" if result.score >= req.min_score else ("✗" if result.score < req.archive_below else "·")
-                            await queue.put(f"{icon} #{job_id} {score_pct} — {title[:45]}")
-                    except Exception as e:
-                        await queue.put(f"✗ #{job_id} error: {e}")
-                    finally:
-                        completed += 1
-                        if completed == total:
-                            await queue.put(None)  # sentinel
-
-            tasks = [asyncio.create_task(score_one(jid, t, d)) for jid, t, d in job_data]
-            while True:
-                msg = await queue.get()
-                if msg is None:
-                    break
-                yield msg
-            await asyncio.gather(*tasks)
-            yield f"→ Pre-filter skipped {skipped}/{total} jobs (saved ~{skipped} LLM calls)"
-        else:
-            for job_id, title, description in job_data:
+    async def gen():
+        sem = asyncio.Semaphore(req.concurrency or config.concurrency)
+        queue = asyncio.Queue()
+        async def one(jid, pid):
+            async with sem:
                 try:
-                    result = fast_score(cv_text, description or "")
-                    with get_session() as session:
-                        job = session.get(Job, job_id)
-                        if job:
-                            job.match_score = result.score
-                            job.match_explanation = result.explanation
-                            link = session.get(JobProfile, (job_id, scoring_profile_id)) if scoring_profile_id else None
-                            if link:
-                                link.match_score, link.match_explanation = result.score, result.explanation
-                                link.screened_at = datetime.utcnow()
-                                from employers.ingestion import mark_scores_fresh
-                                mark_scores_fresh(session, job_id, scoring_profile_id)
-                            set_scored_status(job, JobStatus.SHORTLISTED if result.score >= threshold else JobStatus.ANALYZED)
-                            if result.score >= threshold:
-                                shortlisted += 1
-                    score_pct = f"{result.score:.0%}"
-                    icon = "⭐" if result.score >= req.min_score else "·"
-                    yield f"{icon} #{job_id} {score_pct} — {title[:45]}"
-                except Exception as e:
-                    yield f"✗ #{job_id} error: {e}"
-
-        yield f"✓ Done — {shortlisted}/{len(job_data)} shortlisted"
+                    result = await evaluate(jid, pid, llm=req.llm, force=not req.skip_scored,
+                                            shortlist=req.min_score, archive=req.archive_below)
+                    await queue.put(json.dumps({"job_id": jid, "profile_id": pid, **result}))
+                except Exception as exc:
+                    await queue.put(f"✗ #{jid} profile {pid}: {str(exc)[:200]}")
+        yield f"Evaluating {len(payloads)} vacancy/profile pairs"
+        workers = [asyncio.create_task(one(*p)) for p in payloads]
+        try:
+            for _ in workers:
+                yield await queue.get()
+            await asyncio.gather(*workers)
+        finally:
+            for worker in workers:
+                if not worker.done():
+                    worker.cancel()
+            await asyncio.gather(*workers, return_exceptions=True)
+        yield "✓ Evaluation finished; pending extraction/budget work remains eligible"
     return await sse(gen())
 
 
@@ -731,10 +483,11 @@ class PurgeRequest(BaseModel):
 @app.post("/run/purge-archived")
 async def run_purge_archived(req: PurgeRequest):
     async def gen():
-        from db.models import Job, JobStatus, RawJob, Application, JobEvent
+        from db.models import Job, JobProfile, JobStatus, RawJob, Application, JobEvent
         from db.session import get_session
 
         # Include NEW/ANALYZED/ARCHIVED — all statuses the user hasn't manually acted on
+        from sqlalchemy import or_
         _purgeable = [JobStatus.NEW, JobStatus.ANALYZED, JobStatus.ARCHIVED]
 
         with get_session() as session:
@@ -742,6 +495,10 @@ async def run_purge_archived(req: PurgeRequest):
                 session.query(Job)
                 .filter(
                     Job.status.in_(_purgeable),
+                    Job.status_origin.notin_(["user", "legacy_unknown"]),
+                    Job.description_quality == "complete",
+                    ~Job.id.in_(session.query(JobProfile.job_id).filter(or_(
+                        JobProfile.score_stale.is_(True), JobProfile.score_method != "llm"))),
                     Job.match_score.isnot(None),
                     Job.match_score < req.max_score,
                     ~Job.application.has(),
@@ -753,7 +510,9 @@ async def run_purge_archived(req: PurgeRequest):
                 .order_by(Job.match_score.asc())
                 .all()
             )
-            job_data = [(j.id, j.title, j.match_score, j.status.value) for j in jobs]
+            from analyzer.matching import all_profiles_below
+            job_data = [(j.id, j.title, j.match_score, j.status.value) for j in jobs
+                        if all_profiles_below(session, j, req.max_score)]
 
         mode = "DRY RUN" if req.dry_run else "DELETE"
         yield f"[{mode}] {len(job_data)} jobs (new/analyzed/archived) with score < {req.max_score:.0%}"
@@ -1003,7 +762,8 @@ def mark_viewed(job_id: int):
         # Only upgrade status, never downgrade (don't overwrite applied/interview etc.)
         upgradeable = {JobStatus.NEW, JobStatus.ANALYZED, JobStatus.SHORTLISTED}
         if job.status in upgradeable:
-            job.status = JobStatus.VIEWED
+            from job_lifecycle import transition
+            transition(job, JobStatus.VIEWED, origin="user", reason="Vacancy opened")
             job.viewed_at = datetime.utcnow()
             session.add(JobEvent(
                 job_id=job_id,
@@ -1031,7 +791,8 @@ def mark_applied(job_id: int, body: dict):
         job = session.get(Job, job_id)
         if not job:
             raise HTTPException(404, "Job not found")
-        job.status = JobStatus.APPLIED
+        from job_lifecycle import transition
+        transition(job, JobStatus.APPLIED, origin="user", reason="Application recorded")
         job.applied_at = datetime.utcnow()
 
         # Upsert application record
@@ -1091,7 +852,8 @@ def add_event(job_id: int, body: dict, response: Response):
         if not job:
             raise HTTPException(404, "Job not found")
         if ev in STATUS_MAP:
-            job.status = STATUS_MAP[ev]
+            from job_lifecycle import transition
+            transition(job, STATUS_MAP[ev], origin="user", reason="Application event recorded")
         session.add(JobEvent(
             job_id=job_id,
             event_type=ev,

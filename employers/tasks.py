@@ -164,20 +164,35 @@ def _finish(task, status, error=None, delay=0):
 async def _resolve(task):
     with get_session() as session:
         employer = session.get(Employer, task["employer_id"])
-        if employer.classification == "agency":
+        if employer.classification == "agency" and not get_config().include_agencies:
             return
         employer.resolution_status = "resolving"
         evidence = {
             "employer": employer.name,
+            "classification": employer.classification,
             "observations": [
                 row_dict(v)
                 for v in session.scalars(
                     select(EmployerEvidence)
                     .where(EmployerEvidence.employer_id == employer.id)
+                    .order_by(
+                        case((EmployerEvidence.kind == "board", 0), else_=1).desc(),
+                        EmployerEvidence.observed_at.desc(),
+                    )
                     .limit(10)
                 )
             ],
         }
+    from employers.resolution import from_official_links
+
+    deterministic = (
+        await from_official_links(task, evidence, fenced)
+        if evidence["classification"] in {"direct_employer", "agency"}
+        else None
+    )
+    if deterministic:
+        enqueue("onboard", source_id=deterministic)
+        return
     for _ in range(5):
         known_website = any(
             o.get("payload", {}).get("official_url")
@@ -191,6 +206,26 @@ async def _resolve(task):
             search=not evidence.get("searched") and not known_website,
         )
         evidence["searched"] = True
+        if answer.classification == "agency" and not get_config().include_agencies:
+            with get_session() as session:
+                employer = session.get(Employer, task["employer_id"])
+                employer.classification = "agency"
+                employer.resolution_status = "unresolved"
+            return
+        if answer.classification in {"direct_employer", "agency"}:
+            evidence["classification"] = answer.classification
+        if answer.official_url:
+            # A model may find the official site before it finds a career
+            # portal. Follow its public links under the same trusted verifier.
+            evidence.setdefault("candidate_official_urls", []).append(answer.official_url)
+            deterministic = (
+                await from_official_links(task, evidence, fenced)
+                if evidence["classification"] in {"direct_employer", "agency"}
+                else None
+            )
+            if deterministic:
+                enqueue("onboard", source_id=deterministic)
+                return
         if answer.action == "fetch" and answer.url:
             context = CollectionContext(
                 [{"host": urlsplit(answer.url).hostname, "path": "/"}], get_config()
@@ -207,6 +242,10 @@ async def _resolve(task):
             )
             enqueue("onboard", source_id=source_id)
             return
+        elif answer.official_url:
+            evidence["verification_feedback"] = (
+                "Official site proposed, but no verified career portal found. Inspect the official career/vacancy page and its ATS link."
+            )
         else:
             with get_session() as session:
                 employer = session.get(Employer, task["employer_id"])
@@ -224,9 +263,15 @@ async def _generate(task, source, repair=False, incident=None):
             if source["active_version_id"]
             else None
         )
+        if repair and previous is None:
+            previous = session.scalar(
+                select(ConnectorVersion)
+                .where(ConnectorVersion.source_id == source["id"])
+                .order_by(ConnectorVersion.id.desc())
+            )
         evidence = {
             "source": source,
-            "sdk_version": "1",
+            "sdk_version": previous.sdk_version if repair and previous else "2",
             "previous": row_dict(previous) if previous else None,
             "incident": incident,
             "observations": [],
@@ -237,7 +282,7 @@ async def _generate(task, source, repair=False, incident=None):
             references.extend(
                 ("last_success", report[k].get("fixture"))
                 for k in ("first", "second")
-                if k in report
+                if k in report and report[k].get("outcome") in {"complete", "empty"}
             )
         if repair:
             latest = session.scalar(
@@ -253,9 +298,19 @@ async def _generate(task, source, repair=False, incident=None):
             if not reference:
                 continue
             try:
+                saved = artifacts.load(reference)
+                from employers.investigation import samples
+
                 evidence[label] = [
-                    {"url": o.url, "status": o.status, "text": o.text[:20000]}
-                    for o in artifacts.load(reference)[:3]
+                    {
+                        "url": o.url,
+                        "method": o.method,
+                        "body": o.request_body,
+                        "status": o.status,
+                        "key": o.key,
+                        "text": o.text[:20000],
+                    }
+                    for o in samples(saved)
                 ]
             except (OSError, ValueError):
                 evidence[label] = [{"error": "Saved diagnostic evidence is unavailable"}]
@@ -265,6 +320,38 @@ async def _generate(task, source, repair=False, incident=None):
         else source["policy"],
         get_config(),
     )
+    from employers.contracts import CatalogueResult, CollectionResult
+
+    evidence["sdk"] = {
+        "version": evidence["sdk_version"],
+        "runtime": "sdk is passed as a function argument. Return plain Python dictionaries; do not import SDK, at_sdk, application models or any non-installed package.",
+        "methods": {
+            "sdk.json(url, method='GET', body=None)": "returns (parsed_json, evidence_key)",
+            "sdk.fetch(url, method='GET', body=None)": "returns dict with text, url, status, headers, key; not a requests.Response",
+            "sdk.browser(url, actions=[])": "returns bounded HTML and approved observations",
+        },
+        "functions": {
+            "enumerate(config, sdk)": "returns CatalogueResult dictionary; fetch all listing pages, never details",
+            "fetch_detail(config, entry, sdk)": "returns a dictionary containing fetched source data and its real evidence key",
+            "normalize(config, entry, detail)": "returns ONE CollectedPosting dictionary, not CollectionResult; use evidence keys from SDK responses",
+        },
+        "manifest": {
+            "catalogue": {
+                "format": "json",
+                "path_suffix": "actual listing endpoint suffix",
+                "items": "dot.path.to.items",
+                "id": "dot.path.within.item; list index uses .0, not [0]",
+                "total": "dot.path.to.total",
+                "pagination": "offset",
+            }
+        },
+        "catalogue_schema": CatalogueResult.model_json_schema(),
+        "result_schema": CollectionResult.model_json_schema(),
+    }
+    if evidence["sdk_version"] == "1":
+        evidence["sdk"]["functions"] = {
+            "collect(config, sdk)": "returns CollectionResult dictionary"
+        }
     try:
         obs = await context.fetch(source["portal_url"])
         evidence["observations"].append({"url": obs.url, "html": obs.text[:60000]})
@@ -280,12 +367,23 @@ async def _generate(task, source, repair=False, incident=None):
 
             p = public_url(url)
             context.policy.append({"host": p.hostname, "path": p.path, "methods": ["GET"]})
-        if not repair:
-            for _ in range(4):
+        if not repair or not evidence.get("last_success"):
+            from employers.investigation import prime
+
+            evidence["observations"].extend(await prime(source, context))
+            for _ in range(6):
                 answer = await step("connector_investigation", evidence, task["id"])
                 if answer.action == "fetch" and answer.url:
-                    obs = await context.fetch(answer.url)
-                    evidence["observations"].append({"url": obs.url, "text": obs.text[:60000]})
+                    obs = await context.fetch(answer.url, answer.method, answer.body)
+                    evidence["observations"].append(
+                        {
+                            "url": obs.url,
+                            "method": obs.method,
+                            "body": obs.request_body,
+                            "key": obs.key,
+                            "text": obs.text[:60000],
+                        }
+                    )
                 elif answer.action == "browser":
                     from employers.runtime import run_isolated
 
@@ -297,11 +395,53 @@ async def _generate(task, source, repair=False, incident=None):
                     )
                     evidence["observations"].append(result)
                 else:
+                    # Do not generate from a catalogue plus a generic portal
+                    # shell. A separately observed detail is required.
+                    def has_detail(observation):
+                        if observation.method != "GET" or observation.url == source["portal_url"]:
+                            return False
+                        try:
+                            value = observation.json()
+                            return isinstance(value, dict) and any(
+                                key in value
+                                for key in (
+                                    "jobPostingInfo",
+                                    "jobAd",
+                                    "description",
+                                    "jobDescription",
+                                )
+                            )
+                        except (ValueError, TypeError):
+                            from bs4 import BeautifulSoup
+
+                            for node in BeautifulSoup(observation.text, "html.parser").select(
+                                'script[type="application/ld+json"]'
+                            ):
+                                try:
+                                    value = json.loads(node.get_text())
+                                    if (
+                                        isinstance(value, dict)
+                                        and value.get("@type") == "JobPosting"
+                                        and value.get("description")
+                                    ):
+                                        return True
+                                except (ValueError, TypeError):
+                                    continue
+                            return False
+
+                    if not any(has_detail(observation) for observation in context.observations):
+                        evidence["verification_feedback"] = (
+                            "Inspect a real full detail response before generation. The portal HTML and listing summaries are insufficient. For structured platforms prefer their read-only JSON detail endpoint, evidenced by the listing path and public portal."
+                        )
+                        continue
                     evidence["investigation"] = answer.model_dump()
                     break
+            else:
+                raise ValueError("Investigation did not obtain independent detail evidence")
         if repair:
             # Attempt accounting occurs before paid candidate generation so crashes
             # cannot reset or bypass the per-incident cap.
+            fenced(task)
             with get_session() as session:
                 paid_before = (
                     session.query(func.count(BudgetLedger.id))
@@ -345,9 +485,11 @@ async def _generate(task, source, repair=False, incident=None):
         version_id = candidate(
             source["id"],
             code=answer.code,
-            manifest={**answer.manifest,"generation_task_id":task["id"]},
+            manifest={**answer.manifest, "generation_task_id": task["id"]},
             config=answer.config or source["config"],
-            parent_id=source["active_version_id"],
+            parent_id=evidence["previous"]["id"]
+            if evidence["previous"]
+            else source["active_version_id"],
             image_digest=os.environ.get("EMPLOYER_RUNNER_IMAGE", ""),
             policy=context.policy,
         )
@@ -357,6 +499,9 @@ async def _generate(task, source, repair=False, incident=None):
 
 
 async def execute_task(task):
+    from employers.agent import fence_context
+
+    token = fence_context.set(lambda: fenced(task))
     heartbeat = asyncio.create_task(_heartbeat(task))
     try:
         if task["kind"] == "discover":
@@ -402,28 +547,44 @@ async def execute_task(task):
                     policy=saved["manifest"].get("network_policy"),
                 )
                 await validate_activate(version_id, fence=lambda: fenced(task))
+            elif task["kind"] == "validate":
+                version_id = task["payload"]["version_id"]
+                with get_session() as session:
+                    version = session.get(ConnectorVersion, version_id)
+                    if not version or version.source_id != source["id"]:
+                        raise ValueError("Connector version does not belong to this source")
+                await validate_activate(version_id, fence=lambda: fenced(task))
+                enqueue("collect", source_id=source["id"])
             elif task["kind"] == "rollback":
                 await validate_activate(task["payload"]["version_id"], fence=lambda: fenced(task))
             elif task["kind"] in {"onboard", "repair"}:
                 incident = None
-                if task["kind"] == "repair":
-                    with get_session() as session:
-                        row = session.scalar(
-                            select(ConnectorIncident).where(
-                                ConnectorIncident.source_id == source["id"],
-                                ConnectorIncident.status == "open",
-                            )
+                with get_session() as session:
+                    row = session.scalar(
+                        select(ConnectorIncident).where(
+                            ConnectorIncident.source_id == source["id"],
+                            ConnectorIncident.status.in_(["open", "needs_review"]),
                         )
-                        if not row or row.failed_candidates >= 2:
-                            if row:
-                                row.status = "needs_review"
-                            _finish(task, "needs_review")
-                            return
+                    )
+                    if row:
                         incident = row_dict(row)
-                if source["platform"] == "smartrecruiters" and task["kind"] == "onboard":
+                repair_mode = task["kind"] == "repair" or incident is not None
+                if repair_mode and (
+                    not incident
+                    or incident["failed_candidates"] >= 2
+                    or incident["status"] == "needs_review"
+                ):
+                    with get_session() as session:
+                        if incident:
+                            session.get(ConnectorIncident, incident["id"]).status = "needs_review"
+                        if not source["active_version_id"]:
+                            session.get(EmployerSource, source["id"]).health = "blocked"
+                    _finish(task, "needs_review")
+                    return
+                if source["platform"] == "smartrecruiters" and not repair_mode:
                     version_id = candidate(source["id"], parent_id=source["active_version_id"])
                 else:
-                    version_id = await _generate(task, source, task["kind"] == "repair", incident)
+                    version_id = await _generate(task, source, repair_mode, incident)
                 await validate_activate(version_id, fence=lambda: fenced(task))
                 enqueue("collect", source_id=source["id"])
             else:
@@ -466,8 +627,6 @@ async def execute_task(task):
             if task["source_id"]:
                 source = session.get(EmployerSource, task["source_id"])
                 source.health, source.last_error = "degraded", error
-                if task["kind"] == "onboard":
-                    source.enabled = False
                 source.next_due_at = datetime.utcnow() + timedelta(hours=get_config().poll_hours)
                 incident = session.scalar(
                     select(ConnectorIncident).where(
@@ -483,17 +642,18 @@ async def execute_task(task):
                     )
                     session.add(incident)
                     session.flush()
-                repair = (
-                    incident.status == "open"
-                    and incident.failed_candidates < 2
-                    and task["kind"] != "onboard"
-                )
+                if incident.failed_candidates >= 2:
+                    incident.status = "needs_review"
+                    if not source.active_version_id:
+                        source.health = "blocked"
+                repair = incident.status == "open" and incident.failed_candidates < 2
             if task["employer_id"]:
                 session.get(Employer, task["employer_id"]).resolution_status = "needs_review"
         _finish(task, "failed", error)
         if repair:
             enqueue("repair", source_id=task["source_id"])
     finally:
+        fence_context.reset(token)
         heartbeat.cancel()
         await asyncio.gather(heartbeat, return_exceptions=True)
 
@@ -515,7 +675,10 @@ async def dispatch():
         )
         sources = session.scalars(
             select(EmployerSource).where(
-                EmployerSource.enabled.is_(True), EmployerSource.next_due_at <= now
+                EmployerSource.enabled.is_(True),
+                EmployerSource.next_due_at <= now,
+                (EmployerSource.health != "blocked")
+                | EmployerSource.active_version_id.is_not(None),
             )
         ).all()
         source_work = [(s.id, "collect" if s.active_version_id else "onboard") for s in sources]
@@ -527,10 +690,23 @@ async def dispatch():
         employers = session.scalars(
             select(Employer)
             .where(Employer.resolution_status == "discovered")
+            .where((Employer.classification != "agency") | get_config().include_agencies)
             .order_by(Employer.last_seen_at.desc())
             .limit(max(0, config.onboarding_per_day - today))
         ).all()
         employer_ids = [e.id for e in employers]
+        # Keep one daily slot for the oldest unseen employer, even when recent
+        # board observations continually replenish the front of the queue.
+        if config.onboarding_per_day > today and employers:
+            oldest = session.scalar(
+                select(Employer)
+                .where(Employer.resolution_status == "discovered")
+                .where((Employer.classification != "agency") | config.include_agencies)
+                .order_by(Employer.created_at, Employer.id)
+                .limit(1)
+            )
+            if oldest and oldest.id not in employer_ids:
+                employer_ids[-1] = oldest.id
     if not discovered_today:
         enqueue("discover")
     for source_id, kind in source_work:

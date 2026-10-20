@@ -103,6 +103,16 @@ export default function EmployerSourcesView({api}) {
     </section>
     <section style={box}>
       <h3 style={{marginTop:0}}>Recent operations</h3>
+      <label style={{display:"block",fontSize:12,marginBottom:8}}><input type="checkbox" checked={settings.include_agencies||false} onChange={e=>setSettings({...settings,include_agencies:e.target.checked})}/> Include agencies when verifying their own official career portals</label>
+      {!!operations.value?.sources?.length&&<details><summary>Employer yield and collection cost (30 days)</summary>
+        {operations.value.sources.map(value=><div key={value.source_id} style={{padding:8,fontSize:11,borderBottom:"1px solid #d4dece"}}>
+          <b>Source #{value.source_id}</b> · {value.additional_relevant_vacancies} additional relevant vacancies after onboarding · {value.runs.complete+value.runs.empty} complete collections · {value.requests} requests · {value.repair_attempts} repair attempts · ${value.cost_upper_bound_usd.toFixed(4)} cost/reservations
+          <div>{value.scope_note}</div><div>{value.suggestion_reason}</div>
+          <label>Polling interval <select aria-label={`Polling interval for source ${value.source_id}`} value={value.poll_hours??""} onChange={e=>action(async()=>request(`/employer-sources/${value.source_id}/schedule`,{poll_hours:e.target.value?Number(e.target.value):null},"PUT"))}>
+            <option value="">Default</option>{[2,3,4].map(n=><option key={n} value={n}>{n} hours{value.suggested_poll_hours===n?" (suggested)":""}</option>)}
+          </select></label>
+        </div>)}
+      </details>}
       {operations.metrics&&<p style={{fontSize:11}}>
         Direct vacancies: {operations.metrics.direct_vacancies} · Direct only: {operations.metrics.direct_only_vacancies} · Relevant: {operations.metrics.relevant_direct_vacancies} · Today’s cost/reservations: ${operations.metrics.daily_cost_upper_bound_usd.toFixed(3)}
       </p>}

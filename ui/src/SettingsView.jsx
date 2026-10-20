@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import TagEditor from "./TagEditor";
 import EmployerSourcesView from "./EmployerSourcesView";
+import MatchingSettingsView from "./MatchingSettingsView";
 
 const box={background:"#f0f3ed",border:"1px solid #d4dece",borderRadius:6,padding:16};
 const input={width:"100%",padding:"7px 9px",border:"1px solid #c8d8c4",borderRadius:4,fontFamily:"monospace",fontSize:11};
@@ -164,19 +165,23 @@ export default function SettingsView({api,onProfilesChanged}) {
     </section>
 
     <div style={{display:"flex",flexDirection:"column",gap:16}}>
-      <div style={{display:"flex",gap:6}}>{[["ai","AI ROUTING"],["prompts","PROMPTS"],["automation","AUTOMATION"],["priority","PRIORITY"],["employers","EMPLOYER SOURCES"]].map(([id,label])=><button key={id} style={{...button,background:panel===id?"#2e7d5225":"transparent"}} onClick={()=>setPanel(id)}>{label}</button>)}</div>
+      <div style={{display:"flex",gap:6}}>{[["ai","AI ROUTING"],["prompts","PROMPTS"],["automation","AUTOMATION"],["priority","PRIORITY"],["matching","MATCHING"],["employers","EMPLOYER SOURCES"]].map(([id,label])=><button key={id} style={{...button,background:panel===id?"#2e7d5225":"transparent"}} onClick={()=>setPanel(id)}>{label}</button>)}</div>
       {panel==="employers"&&<EmployerSourcesView api={api}/>}
+      {panel==="matching"&&<MatchingSettingsView api={api}/>}
       {panel==="ai"&&<section style={box}>
         <div style={{fontWeight:800}}>OPENROUTER ROUTING</div>
         <div style={{fontSize:10,color:llm.openrouter_configured?"#2e7d52":"#c0392b",marginBottom:10}}>API key: {llm.openrouter_configured?"configured":"missing in environment"}</div>
         <label>Default model<input style={input} value={llm.default_model} onChange={e=>setLlm({...llm,default_model:e.target.value})}/></label>
         <label>Global fallbacks<textarea style={{...input,minHeight:55}} value={(llm.global_fallbacks||[]).join("\n")} onChange={e=>setLlm({...llm,global_fallbacks:e.target.value.split("\n").map(x=>x.trim()).filter(Boolean)})}/></label>
-        <div style={{display:"grid",gridTemplateColumns:"1fr 1.2fr 1.2fr auto",gap:6,alignItems:"center",marginTop:10}}>
-          <b>Operation</b><b>Model override</b><b>Fallbacks</b><span/>
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1.2fr 1.2fr 1fr auto",gap:6,alignItems:"center",marginTop:10}}>
+          <b>Operation</b><b>Model override</b><b>Fallbacks</b><b>Reasoning</b><span/>
           {OPERATIONS.map(op=><div key={op} style={{display:"contents"}}>
             <span style={{fontSize:10}}>{op}</span>
             <input style={input} placeholder="use default" value={llm.operations?.[op]?.model||""} onChange={e=>setLlm({...llm,operations:{...llm.operations,[op]:{...llm.operations[op],model:e.target.value}}})}/>
             <input style={input} placeholder="comma-separated / global" value={(llm.operations?.[op]?.fallbacks||[]).join(", ")} onChange={e=>setLlm({...llm,operations:{...llm.operations,[op]:{...llm.operations[op],fallbacks:e.target.value.split(",").map(x=>x.trim()).filter(Boolean)}}})}/>
+            <select aria-label={`${op} reasoning`} style={input} value={llm.operations?.[op]?.reasoning_effort||""} onChange={e=>setLlm({...llm,operations:{...llm.operations,[op]:{...llm.operations[op],reasoning_effort:e.target.value||null}}})}>
+              <option value="">Provider default</option>{["none","minimal","low","medium","high","xhigh","max"].map(effort=><option key={effort} value={effort}>{effort}</option>)}
+            </select>
             <button style={button} disabled={op.startsWith("employer_")||op.startsWith("connector_")} onClick={()=>testModel(op)}>TEST</button>
           </div>)}
         </div>

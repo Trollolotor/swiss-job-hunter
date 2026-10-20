@@ -90,6 +90,11 @@ class Job(Base):
     status: Mapped[str] = mapped_column(Enum(JobStatus), default=JobStatus.NEW, index=True)
     match_score: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     match_explanation: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    description_quality: Mapped[str] = mapped_column(String(30), default="unknown", server_default="unknown")
+    extraction_json: Mapped[str] = mapped_column(Text, default="{}", server_default="{}")
+    enrichment_attempts: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    enrichment_due_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    status_origin: Mapped[str] = mapped_column(String(30), default="system", server_default="legacy_unknown")
     user_stars: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)  # 1-5, manual interest rating
 
     # Tracking timestamps
@@ -190,6 +195,13 @@ class JobProfile(Base):
     match_explanation: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     screened_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     score_stale: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
+    keyword_score: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    score_method: Mapped[str] = mapped_column(String(30), default="pending", server_default="legacy")
+    evaluation_state: Mapped[str] = mapped_column(String(30), default="pending", server_default="legacy")
+    cv_hash: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    content_hash: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    prompt_revision: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    requirements_json: Mapped[str] = mapped_column(Text, default="[]", server_default="[]")
 
 
 class AppSetting(Base):
@@ -331,3 +343,4 @@ from db.employer_models import (  # noqa: E402,F401
     EmployerEvidence, EmployerSource, EmployerTask, JobSource, JobSourceRevision,
     SourceRun, SourceRunMember,
 )
+from db.optimization_models import BoardSearchRun, DetailCache, JobStatusChange  # noqa: E402,F401

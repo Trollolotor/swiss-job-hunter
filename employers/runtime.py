@@ -16,6 +16,14 @@ class RuntimeUnavailable(RuntimeError):
 
 async def run_isolated(kind, payload, context, image_digest=None, browser_image_digest=None):
     if kind == "browser":
+        lock = _browser_locks.setdefault(id(asyncio.get_running_loop()), asyncio.Lock())
+        async with lock:
+            return await _run_isolated(kind, payload, context, image_digest, browser_image_digest)
+    return await _run_isolated(kind, payload, context, image_digest, browser_image_digest)
+
+
+async def _run_isolated(kind, payload, context, image_digest=None, browser_image_digest=None):
+    if kind == "browser":
         context.allowed(payload["url"])
     socket_path = os.environ.get("EMPLOYER_LAUNCHER_SOCKET", "/run/sjh-connector/launcher.sock")
     try:
@@ -25,6 +33,7 @@ async def run_isolated(kind, payload, context, image_digest=None, browser_image_
             "Isolated launcher is unavailable; install/start the reviewed host runtime"
         ) from exc
     total = 0
+    observation_start = len(context.observations)
 
     async def send(value):
         frame = json.dumps(value, default=str, ensure_ascii=False).encode() + b"\n"
@@ -46,6 +55,8 @@ async def run_isolated(kind, payload, context, image_digest=None, browser_image_
                     observation = await context.fetch(
                         message["url"], message.get("method", "GET"), message.get("body")
                     )
+                    if hasattr(context, "fresh_detail_keys"):
+                        context.fresh_detail_keys.add(observation.key)
                     await send(
                         {
                             "ok": True,
@@ -56,19 +67,52 @@ async def run_isolated(kind, payload, context, image_digest=None, browser_image_
                             "key": observation.key,
                         }
                     )
+                elif op == "catalogue":
+                    if kind != "python" or payload.get("sdk_version") != "2":
+                        raise ValueError("Catalogue staging requires SDK v2")
+                    from employers.contracts import CatalogueResult
+                    from employers.cache import cached
+
+                    catalogue = CatalogueResult.model_validate(message["catalogue"])
+                    if len({e.identity for e in catalogue.entries}) != len(catalogue.entries):
+                        raise ValueError("Duplicate catalogue entry")
+                    if {e.posting_id for e in catalogue.entries} != set(catalogue.observed_ids):
+                        raise ValueError("Catalogue entries and observed IDs disagree")
+                    context.catalogue_entries = catalogue.entries
+                    context.cached_postings = []
+                    work = []
+                    for entry in catalogue.entries:
+                        context.allowed(entry.detail_url)
+                        posting = cached(context, entry)
+                        if posting is None:
+                            work.append(entry.model_dump())
+                        else:
+                            context.cached_postings.append(posting)
+                            context.staged.append(posting)
+                    await send({"ok": True, "entries": work})
+                elif op == "sighting":
+                    if kind != "python" or payload.get("sdk_version") != "2":
+                        raise ValueError("Staging requires SDK v2")
+                    from employers.contracts import CollectedPosting
+                    from employers.validation import posting_errors
+
+                    posting = CollectedPosting.model_validate(message["posting"])
+                    errors = posting_errors(posting, context.observations)
+                    if len(context.staged) >= 10000 or errors:
+                        raise ValueError(
+                            "Posting sighting rejected: "
+                            + ("; ".join(errors) if errors else "sighting limit exceeded")
+                        )
+                    context.staged.append(posting)
+                    await send({"ok": True})
                 elif op == "browser":
                     if kind != "python":
                         raise ValueError("Nested browser requests are forbidden")
                     if not browser_image_digest:
                         raise ValueError("Browser runtime is not pinned in this connector version")
-                    lock = _browser_locks.setdefault(id(asyncio.get_running_loop()), asyncio.Lock())
-                    async with lock:
-                        result = await run_isolated(
-                            "browser",
-                            message["request"],
-                            context,
-                            image_digest=browser_image_digest,
-                        )
+                    result = await run_isolated(
+                        "browser", message["request"], context, image_digest=browser_image_digest
+                    )
                     from employers.network import Observation
 
                     snapshot = Observation(
@@ -78,7 +122,21 @@ async def run_isolated(kind, payload, context, image_digest=None, browser_image_
                     result["key"] = snapshot.key
                     await send({"ok": True, "result": result})
                 elif op == "result":
-                    return message["result"]
+                    result = message["result"]
+                    if kind == "browser":
+                        result["network"] = [
+                            {
+                                "url": o.url,
+                                "method": o.method,
+                                "body": o.request_body,
+                                "status": o.status,
+                                "key": o.key,
+                                "text": o.text[:20000],
+                            }
+                            for o in context.observations[observation_start:]
+                            if o.method == "POST" or "json" in o.headers.get("content-type", "")
+                        ][:20]
+                    return result
                 elif op == "error":
                     error = str(message.get("error", "Runner failed"))[:2000]
                     if "runtime failed" in error or "image changed" in error:
@@ -95,9 +153,17 @@ async def run_isolated(kind, payload, context, image_digest=None, browser_image_
 async def collect_generated(version, context):
     value = await run_isolated(
         "python",
-        {"code": version.code, "config": json.loads(version.config_json)},
+        {
+            "code": version.code,
+            "config": json.loads(version.config_json),
+            "sdk_version": version.sdk_version,
+        },
         context,
         version.image_digest,
         json.loads(version.manifest_json).get("browser_image_digest"),
     )
-    return CollectionResult.model_validate(value)
+    result = CollectionResult.model_validate(value)
+    if version.sdk_version == "2":
+        result.postings = context.staged
+    result.observed_identities = [p.identity for p in result.postings]
+    return result

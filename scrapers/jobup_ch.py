@@ -1,58 +1,29 @@
 """
 Scraper for jobup.ch — leading job board for French-speaking Switzerland.
-Uses their public REST API.
+
+jobup.ch is JobCloud's sister site to jobs.ch and serves the same search page:
+a JSON-LD ItemList plus result cards keyed by vacancy UUID, the same
+wrap-back-to-page-1 past the last page, and the same detail-page markup. So
+this reuses the jobs.ch scraper and only swaps the URLs.
+
+It used to call the public search API (job-search-api.jobup.ch), which still
+answers 200 but now ignores `term` and returns the same unfiltered feed for
+every query (#26).
 """
 from __future__ import annotations
 
 import json
 from datetime import datetime
-from typing import AsyncGenerator, Optional, Tuple
-from urllib.parse import urlencode
+from typing import Optional
+from scrapers.base import ScrapedJob
 
-from scrapers.base import BaseScraper, ScrapedJob
-
-_API_BASE = "https://job-search-api.jobup.ch/search"
-_PAGE_SIZE = 20
-_HEADERS = {
-    "Origin": "https://www.jobup.ch",
-    "Referer": "https://www.jobup.ch/",
-}
+from scrapers.jobs_ch import JobsChScraper
 
 
-class JobupChScraper(BaseScraper):
+class JobupChScraper(JobsChScraper):
     source_name = "jobup.ch"
-
-    async def scrape(
-        self, keyword: str, location: str = "Genève", max_pages: int = 5
-    ) -> AsyncGenerator[ScrapedJob, None]:
-        for page in range(1, max_pages + 1):
-            params = {
-                "term": keyword,
-                "page": page,
-                "rows": _PAGE_SIZE,
-            }
-            if location:
-                params["location"] = location
-            url = f"{_API_BASE}?{urlencode(params)}"
-
-            try:
-                resp = await self._fetch(url, headers=_HEADERS)
-                data = resp.json()
-            except Exception as exc:
-                print(f"[jobup.ch] page {page} error: {exc}")
-                break
-
-            jobs = data.get("documents", [])
-            if not jobs:
-                break
-
-            for doc in jobs:
-                job = self._parse(doc)
-                if job:
-                    yield job
-
-            if page >= data.get("numPages", 1):
-                break
+    search_url = "https://www.jobup.ch/en/jobs/"
+    detail_url = "https://www.jobup.ch/en/jobs/detail/"
 
     def _parse(self, doc: dict) -> Optional[ScrapedJob]:
         try:
@@ -86,26 +57,4 @@ class JobupChScraper(BaseScraper):
             )
         except Exception as exc:
             print(f"[jobup.ch] parse error: {exc}")
-            return None
-
-    async def fetch_full_description(self, source_job_id: str) -> Optional[Tuple[str, str]]:
-        from bs4 import BeautifulSoup
-        url = (
-            source_job_id
-            if source_job_id.startswith("http")
-            else f"https://www.jobup.ch/en/jobs/detail/{source_job_id}/"
-        )
-        try:
-            resp = await self._fetch(url)
-            if resp.status_code in (404, 410):
-                return ()  # type: ignore
-            soup = BeautifulSoup(resp.text, "lxml")
-            el = soup.select_one("[class*='grid-area_description']")
-            if el:
-                text = el.get_text(separator="\n", strip=True)
-                if len(text) > 100:
-                    return text, url
-            return None
-        except Exception as exc:
-            print(f"[jobup.ch] enrich error for {source_job_id}: {exc}")
             return None

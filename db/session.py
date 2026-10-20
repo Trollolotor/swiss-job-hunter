@@ -110,6 +110,9 @@ def _init_db_once() -> None:
         }.items():
             if name not in job_profile_columns:
                 conn.execute(text(f"ALTER TABLE job_profiles ADD COLUMN {name} {sql_type}"))
+    from importlib import import_module
+    with engine.begin() as conn:
+        import_module("migrations.versions.20261021_agent_optimization").add_columns(conn)
     _import_legacy_profiles()
 
 

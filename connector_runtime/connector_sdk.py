@@ -1,14 +1,17 @@
-"""Version 1 synchronous IPC SDK, installed inside the untrusted-code image."""
+"""Versioned synchronous IPC SDK, installed inside the untrusted-code image."""
 
 import json
 import sys
 
 
 class SDK:
-    version = "1"
+    version = "2"
+
+    def __init__(self):
+        self._protocol = sys.stdout
 
     def _request(self, message):
-        print(json.dumps(message), flush=True)
+        print(json.dumps(message), flush=True, file=self._protocol)
         line = sys.stdin.readline(8 * 1024 * 1024)
         if not line or not line.endswith("\n"):
             raise RuntimeError("Controller disconnected")

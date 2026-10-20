@@ -60,12 +60,14 @@ async def test_jobscout_reuses_known_source_id_without_detail_fetch(monkeypatch)
     from types import SimpleNamespace
     from scrapers.jobscout24 import JobScout24Scraper
 
-    scraper = JobScout24Scraper(known_jobs={"known-id": {
+    scraper = JobScout24Scraper(known_jobs={"550e8400-e29b-41d4-a716-446655440000": {
         "title": "Known Engineer", "company": "Known AG", "location": "Bern",
         "description": "already enriched", "url": "https://example.test/known",
     }})
-    async def fake_fetch(_url):
-        return SimpleNamespace(text='<a href="/en/job/known-id">Known</a>')
+    async def fake_fetch(_url, **kwargs):
+        if "/Cities/" in _url:
+            return SimpleNamespace(json=lambda: [{"Text": "Bern", "Value": "3000"}])
+        return SimpleNamespace(status_code=200, text='<li class="job-list-item" data-job-detail-url="/en/job/550e8400-e29b-41d4-a716-446655440000"></li>')
     async def forbidden_detail(*_args):
         raise AssertionError("known source IDs must not fetch detail pages")
     monkeypatch.setattr(scraper, "_fetch", fake_fetch)
@@ -73,4 +75,4 @@ async def test_jobscout_reuses_known_source_id_without_detail_fetch(monkeypatch)
 
     jobs = [job async for job in scraper.scrape("engineer", "Bern", 1)]
     assert len(jobs) == 1
-    assert jobs[0].source_job_id == "known-id"
+    assert jobs[0].source_job_id == "550e8400-e29b-41d4-a716-446655440000"

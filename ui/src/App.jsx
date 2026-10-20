@@ -1,6 +1,9 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import SettingsView from "./SettingsView";
 import TagEditor from "./TagEditor";
+import ReviewQueue from "./ReviewQueue";
+import VacancyEvidence from "./VacancyEvidence";
+import {vacancyQuery} from "./vacancyQuery";
 
 const API = import.meta.env.VITE_API_BASE_URL ?? "http://localhost:8765";
 
@@ -461,7 +464,10 @@ export default function App() {
   const [filterMinStars, setFilterMinStars] = useState(0);
   const [coverLetter, setCoverLetter] = useState("");
   const [coverLang, setCoverLang] = useState("en");
-  const [threshold, setThreshold] = useState(10); // percent — shared by archive/purge/filter/lookup
+  const [threshold, setThreshold] = useState(0); // display filter only
+  const [companyMinScore,setCompanyMinScore]=useState(30);
+  const [purgeMaxScore,setPurgeMaxScore]=useState(10);
+  const [directOnly,setDirectOnly]=useState(false);
   const [searchPages, setSearchPages] = useState(3);
   const [keywordPresets, setKeywordPresets] = useState({});
   const [linkedinTimeRange, setLinkedinTimeRange] = useState("r604800");
@@ -490,17 +496,22 @@ export default function App() {
   const fetchJobs = useCallback(async () => {
     try {
       const profileId=profiles.find(p=>p.slug===direction)?.id||"";
-      const r = await fetch(`${API}/jobs?status=${filterStatus}&q=${encodeURIComponent(filterText)}&direction=${direction||"all"}&profile_id=${profileId}&min_stars=${filterMinStars}&sort=${sortMode}&published_within=${publishedWithin}`);
+      const params=vacancyQuery({profileId,direction,status:filterStatus,q:filterText,minStars:filterMinStars,sort:sortMode,publishedWithin,directOnly,reviewQueue:mainTab==="review",minScore:threshold/100});
+      const r = await fetch(`${API}/jobs?${params}`);
       if (r.ok) { const data=await r.json();setJobs(data);setSelected(current=>current?data.find(j=>j.id===current.id)||current:current);setBackendOk(true); }
     } catch {
       if (backendOk) addLog("✗ Backend offline — run: python server.py");
       setBackendOk(false);
     }
-  }, [filterStatus, filterText, direction, profiles, filterMinStars, sortMode, publishedWithin, addLog, backendOk]);
+  }, [filterStatus, filterText, direction, profiles, filterMinStars, sortMode, publishedWithin, directOnly, mainTab, threshold, addLog, backendOk]);
 
   const fetchStats = useCallback(async () => {
-    try { const r=await fetch(`${API}/stats?threshold=${threshold/100}`); if(r.ok) setStats(await r.json()); } catch {}
-  }, [threshold]);
+    try {
+      const params=vacancyQuery({profileId:profiles.find(p=>p.slug===direction)?.id,direction,status:filterStatus,q:filterText,minStars:filterMinStars,publishedWithin,directOnly,reviewQueue:mainTab==="review",minScore:threshold/100});
+      params.set("threshold",String(threshold/100));
+      const r=await fetch(`${API}/stats?${params}`); if(r.ok)setStats(await r.json());
+    }catch{}
+  },[threshold,profiles,direction,filterStatus,filterText,directOnly,mainTab,filterMinStars,publishedWithin]);
 
   useEffect(() => { fetchJobs(); fetchStats(); }, [fetchJobs, fetchStats]);
 
@@ -643,7 +654,7 @@ export default function App() {
       for (const src of (enrichSources.length ? enrichSources : [searchSrc[0]||"jobs.ch"])) {
         await runStream("run/enrich", {limit:9999, source:src, rescore_llm:false, direction:dir}, `enrich-${src}`);
       }
-      await runStream("run/analyze", {limit:9999, llm:true, archive_below:threshold/100, direction:dir}, "analyze-llm");
+      await runStream("run/analyze", {limit:9999, llm:true, direction:dir}, "analyze-llm");
       addLog("━━━ PIPELINE DONE ━━━");
     } finally {
       pipelineRunning.current = false;
@@ -732,12 +743,13 @@ export default function App() {
     fetchJobs(); fetchStats();
   };
 
-  const updateStatus = async (jobId, status) => {
-    await fetch(`${API}/jobs/${jobId}/status`,{
+  const updateStatus = async (jobId, status, reason="") => {
+    const response = await fetch(`${API}/jobs/${jobId}/status`,{
       method:"PATCH",headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({status}),
+      body:JSON.stringify({status,reason}),
     });
-    fetchJobs(); fetchStats();
+    if(!response.ok)throw new Error(await response.text());
+    await fetchJobs(); await fetchStats();
     addLog(`✓ #${jobId} → ${status}`);
     if (selected?.id===jobId) setSelected(p=>({...p,status}));
   };
@@ -789,6 +801,7 @@ export default function App() {
           <div style={{width:1,height:16,background:"#d4dece"}}/>
           {/* Main tabs */}
           <Tab id="board" label="BOARD" active={mainTab==="board"} onClick={()=>setMainTab("board")}/>
+          <Tab id="review" label="REVIEW QUEUE" active={mainTab==="review"} onClick={()=>setMainTab("review")}/>
           <Tab id="tracker" label="TRACKER" active={mainTab==="tracker"} onClick={()=>setMainTab("tracker")}/>
           <Tab id="settings" label="SETTINGS" active={mainTab==="settings"} onClick={()=>setMainTab("settings")}/>
           <div style={{flex:1}}/>
@@ -819,6 +832,10 @@ export default function App() {
 
           {mainTab==="settings"
             ? <SettingsView api={API} onProfilesChanged={()=>location.reload()}/>
+            : mainTab==="review"
+            ? <ReviewQueue jobs={visible} onDecision={updateStatus}
+                onSelect={j=>{setSelected(j);setMainTab("board");}}
+                onPrepare={j=>{setSelected(j);setMainTab("board");tailorCv(j);}}/>
             : mainTab==="tracker"
             ? <TrackerBoard onSelectJob={j=>{setSelected(j);setMainTab("board");}}/>
             : <>
@@ -956,24 +973,26 @@ export default function App() {
                     loading={loading.analyze} label="SCORE (KEYWORD)" icon="⚡"
                     color="#f59e0b" disabled={!stats.total}/>
                   <div style={{display:"flex",alignItems:"center",gap:6}}>
-                    <Btn onClick={()=>runStream("run/analyze",{limit:9999,llm:true,archive_below:threshold/100,direction:direction==="all"?null:direction},"analyze-llm")}
+                    <Btn onClick={()=>runStream("run/analyze",{limit:9999,llm:true,direction:direction==="all"?null:direction},"analyze-llm")}
                       loading={loading["analyze-llm"]} label="SCORE (LLM)" icon="🧠"
                       color="#a78bfa" disabled={!stats.total}/>
-                    <Btn onClick={()=>runStream("run/analyze",{llm:true,skip_scored:false,archive_below:threshold/100,concurrency:10,direction:direction==="all"?null:direction},"rescore-all")}
+                    <Btn onClick={()=>runStream("run/analyze",{llm:true,skip_scored:false,concurrency:10,direction:direction==="all"?null:direction},"rescore-all")}
                       loading={loading["rescore-all"]} label="RESCORE ALL" icon="🔄"
                       color="#6366f1" disabled={!stats.total}/>
                   </div>
-                  <Btn onClick={()=>runStream("run/company-lookup",{min_score:threshold/100},"company-lookup")}
+                  <label style={{fontSize:10}}>Company lookup minimum fit (%) <input aria-label="Company lookup minimum fit (%)" type="number" min="0" max="100" value={companyMinScore} onChange={e=>setCompanyMinScore(Number(e.target.value))}/></label>
+                  <label style={{fontSize:10}}>Purge maximum fit (%) <input aria-label="Purge maximum fit (%)" type="number" min="0" max="100" value={purgeMaxScore} onChange={e=>setPurgeMaxScore(Number(e.target.value))}/></label>
+                  <Btn onClick={()=>runStream("run/company-lookup",{min_score:companyMinScore/100},"company-lookup")}
                     loading={loading["company-lookup"]} label="LOOKUP COMPANIES" icon="🏢"
                     color="#2e7d52" disabled={!stats.total}/>
-                  <Btn onClick={()=>confirm("Refresh structured info for all matching companies?")&&runStream("run/company-lookup",{min_score:threshold/100,force:true},"company-refresh")}
+                  <Btn onClick={()=>confirm("Refresh structured info for all matching companies?")&&runStream("run/company-lookup",{min_score:companyMinScore/100,force:true},"company-refresh")}
                     loading={loading["company-refresh"]} label="REFRESH COMPANIES" icon="↻"
                     color="#2e7d52" disabled={!stats.total}/>
                   <div style={{height:1,background:"#d4dece",margin:"2px 0"}}/>
                   <div style={{display:"flex",alignItems:"center",gap:5}}>
-                    <Btn onClick={()=>runStream("run/purge-archived",{max_score:threshold/100,dry_run:true},"purge-preview")}
+                    <Btn onClick={()=>runStream("run/purge-archived",{max_score:purgeMaxScore/100,dry_run:true},"purge-preview")}
                       loading={loading["purge-preview"]} label="PREVIEW" icon="🔍" small color="#6b8c7a"/>
-                    <Btn onClick={()=>runStream("run/purge-archived",{max_score:threshold/100,dry_run:false},"purge")}
+                    <Btn onClick={()=>runStream("run/purge-archived",{max_score:purgeMaxScore/100,dry_run:false},"purge")}
                       loading={loading["purge"]} label="PURGE" icon="🗑" small color="#f87171"/>
                   </div>
                 </div>
@@ -981,6 +1000,7 @@ export default function App() {
                 {/* Filter */}
                 <div style={{padding:"6px 10px",borderBottom:"1px solid #d4dece"}}>
                   <div style={{fontSize:9,color:"#5a7a68",letterSpacing:"0.12em",fontWeight:700,marginBottom:4}}>FILTER</div>
+                  <label style={{fontSize:10}}><input type="checkbox" checked={directOnly} onChange={e=>setDirectOnly(e.target.checked)}/> Not yet observed on our monitored boards</label>
                   <div style={{display:"flex",flexWrap:"wrap",gap:3,marginBottom:5}}>
                     {["all","new","shortlisted","viewed","considering","applied","interviewing","offer","rejected"].map(s=>(
                       <button key={s} onClick={()=>setFilterStatus(s)} style={{
@@ -999,7 +1019,7 @@ export default function App() {
                       <span style={{fontSize:9,color:"#5a7a68",fontFamily:"monospace",whiteSpace:"nowrap"}}>threshold ≥</span>
                       <input type="number" min={0} max={100} step={5} value={threshold}
                         onChange={e=>{const v=Math.max(0,Math.min(100,parseInt(e.target.value)||0));setThreshold(v);}}
-                        title="score threshold % — used by filter, archive, purge, lookup" style={{...inp,width:52,textAlign:"center",fontSize:10}}/>
+                        aria-label="Minimum displayed fit (%)" title="Display filter only; processing thresholds are in Settings → Matching" style={{...inp,width:52,textAlign:"center",fontSize:10}}/>
                       <span style={{fontSize:9,color:"#5a7a68",fontFamily:"monospace"}}>%</span>
                     </div>
                   </div>
@@ -1151,6 +1171,7 @@ export default function App() {
                           </div>
                         </div>
 
+                        <VacancyEvidence job={selected}/>
                         {selected.match_explanation&&(
                           <div style={{background:"#e2e8dc",border:"1px solid #d4dece",borderRadius:5,
                             padding:"9px 11px",marginBottom:12,fontSize:10,color:"#4a7a60",lineHeight:1.6}}>
@@ -1179,7 +1200,7 @@ export default function App() {
                               )}
                             </>)}
                           </div>
-                          <div style={{fontSize:10,color:"#708878",lineHeight:1.7,maxHeight:200,overflowY:"auto",
+                          <div tabIndex={0} aria-label="Resizable vacancy description" style={{fontSize:10,color:"#708878",lineHeight:1.7,height:260,minHeight:100,resize:"vertical",overflowY:"auto",
                             background:"#e2e8dc",borderRadius:5,padding:"9px 11px",border:"1px solid #d4dece",
                             whiteSpace:"pre-wrap"}}>
                             {selected.description
@@ -1206,7 +1227,7 @@ export default function App() {
                           <div style={{fontSize:9,color:"#5a7a68",letterSpacing:"0.1em",fontWeight:700,marginBottom:7}}>UPDATE STATUS</div>
                           <div style={{display:"flex",flexWrap:"wrap",gap:5,marginBottom:10}}>
                             {["viewed","considering","shortlisted","applied","interviewing","offer","rejected","archived"].map(s=>(
-                              <button key={s} onClick={()=>{
+                              <button key={s} aria-pressed={selected.status===s} aria-label={`Set status ${s}`} onClick={()=>{
                                 if(s==="applied") setApplyModal(true);
                                 else updateStatus(selected.id,s);
                               }} style={{

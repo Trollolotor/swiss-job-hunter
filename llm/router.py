@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import itertools
+import time
 from typing import Optional
 
 LLM_TIMEOUT = 120  # seconds; hung API calls are cancelled and re-raise TimeoutError
@@ -71,7 +72,7 @@ def _next_provider() -> str:
 async def _call_anthropic(system: str, user: str, max_tokens: int) -> str:
     import anthropic
 
-    client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
+    client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key, max_retries=0)
     messages = [{"role": "user", "content": user}]
     response = await client.messages.create(
         model=settings.anthropic_model,
@@ -79,6 +80,8 @@ async def _call_anthropic(system: str, user: str, max_tokens: int) -> str:
         system=system,
         messages=messages,
     )
+    from llm.spending import remember
+    remember(response)
     return response.content[0].text.strip()
 
 
@@ -88,6 +91,7 @@ async def _call_deepseek(system: str, user: str, max_tokens: int) -> str:
     from openai import AsyncOpenAI
 
     client = AsyncOpenAI(
+        max_retries=0,
         api_key=settings.deepseek_api_key,
         base_url=settings.deepseek_base_url,
     )
@@ -99,6 +103,8 @@ async def _call_deepseek(system: str, user: str, max_tokens: int) -> str:
             {"role": "user", "content": user},
         ],
     )
+    from llm.spending import remember
+    remember(response)
     return (response.choices[0].message.content or "").strip()
 
 
@@ -108,6 +114,7 @@ async def _call_openrouter(system: str, user: str, max_tokens: int) -> str:
     from openai import AsyncOpenAI
 
     client = AsyncOpenAI(
+        max_retries=0,
         api_key=settings.openrouter_api_key,
         base_url=settings.openrouter_base_url,
         default_headers={
@@ -123,6 +130,8 @@ async def _call_openrouter(system: str, user: str, max_tokens: int) -> str:
             {"role": "user", "content": user},
         ],
     )
+    from llm.spending import remember
+    remember(response)
     return (response.choices[0].message.content or "").strip()
 
 
@@ -132,6 +141,7 @@ async def _call_ollama(system: str, user: str, max_tokens: int) -> str:
     from openai import AsyncOpenAI
 
     client = AsyncOpenAI(
+        max_retries=0,
         api_key="ollama",  # Ollama ignores the key but the SDK requires a non-empty string
         base_url=settings.ollama_base_url,
     )
@@ -145,6 +155,8 @@ async def _call_ollama(system: str, user: str, max_tokens: int) -> str:
         ],
     )
 
+    from llm.spending import remember
+    remember(response)
     return (response.choices[0].message.content or "").strip()
 
 
@@ -184,4 +196,39 @@ async def call_llm(
         coro = _call_ollama(system, user, max_tokens)
     else:
         raise ValueError(f"Unknown provider: {p}")
-    return await asyncio.wait_for(coro, timeout=LLM_TIMEOUT), p
+    from llm.spending import OPERATIONS, reserve, settle, response_metadata
+    from llm.task_router import _semaphore, _log
+    from config.runtime import get_llm_config
+    from analyzer.config import get_config as matching_config
+    concurrency = matching_config().concurrency if operation in OPERATIONS else get_llm_config()["concurrency"]
+    semaphore = _semaphore("matching" if operation in OPERATIONS else operation, concurrency)
+    try:
+        await semaphore.acquire()
+    except BaseException:
+        coro.close()
+        raise
+    model_name = model or getattr(settings, p + "_model")
+    reservation = None
+    started = time.monotonic()
+    try:
+        try:
+            reservation = reserve(operation, f"{p}:{model_name}", system + user, max_tokens, free=p == "ollama")
+        except BaseException:
+            coro.close()
+            raise
+        response_metadata.set({})
+        answer = await asyncio.wait_for(coro, timeout=LLM_TIMEOUT)
+        metadata = {**response_metadata.get(), "latency_ms":int((time.monotonic()-started)*1000)}
+        settle(reservation, metadata)
+        usage = metadata.get("usage", {})
+        _log(operation,f"{p}:{model_name}",metadata["latency_ms"],0,True,
+             usage.get("prompt_tokens",usage.get("input_tokens")),
+             usage.get("completion_tokens",usage.get("output_tokens")))
+        return answer, p
+    except BaseException as exc:
+        settle(reservation, response_metadata.get(), error=exc)
+        _log(operation,f"{p}:{model_name}",int((time.monotonic()-started)*1000),0,False,
+             error=f"{type(exc).__name__}: {exc}")
+        raise
+    finally:
+        semaphore.release()

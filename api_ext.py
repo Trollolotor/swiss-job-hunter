@@ -29,6 +29,41 @@ from cv_sections import (
 router = APIRouter()
 
 
+@router.get("/settings/matching")
+def read_matching_settings():
+    from analyzer.config import get_config
+    from db.models import BudgetLedger
+    from db.session import get_session
+    from sqlalchemy import func
+    from datetime import datetime
+    config = get_config()
+    day = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+    with get_session() as session:
+        spent = session.query(func.sum(func.coalesce(BudgetLedger.actual_usd, BudgetLedger.reserved_usd))).filter(
+            BudgetLedger.category == "matching", BudgetLedger.created_at >= day).scalar() or 0
+    return {"settings": config.model_dump(), "daily_cost_upper_bound_usd": spent}
+
+
+@router.put("/settings/matching")
+def write_matching_settings(body: dict):
+    from analyzer.config import MatchingSettings
+    try:
+        config = MatchingSettings.model_validate(body)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    put_setting("matching", config.model_dump())
+    return read_matching_settings()
+
+
+@router.get("/collection/board-runs")
+def board_runs(limit: int = 30):
+    from db.models import BoardSearchRun
+    from db.session import get_session
+    from employers.service import row_dict
+    with get_session() as session:
+        return [row_dict(r) for r in session.query(BoardSearchRun).order_by(BoardSearchRun.id.desc()).limit(max(1, min(limit, 200)))]
+
+
 class ProfileBody(BaseModel):
     slug: str
     name: str
@@ -136,6 +171,10 @@ def update_profile(profile_id: int, body: ProfileBody):
         sections, cv_text = _profile_cv(body)
         row.keywords_json = json.dumps(normalize_keywords(body.keywords), ensure_ascii=False)
         row.cv_sections_json = json.dumps(sections, ensure_ascii=False)
+        if row.cv_text != cv_text:
+            from db.models import JobProfile
+            session.query(JobProfile).filter_by(profile_id=profile_id).update(
+                {JobProfile.score_stale: True}, synchronize_session=False)
         row.cv_text, row.active = cv_text, body.active
         row.default_location = body.default_location.strip()
         session.flush()

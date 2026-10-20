@@ -6,7 +6,7 @@ import json
 import socket
 import time
 from dataclasses import dataclass
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 import httpx
 from httpcore._backends.anyio import AnyIOBackend
@@ -23,6 +23,8 @@ class CollectionLimit(RuntimeError):
 
 
 def public_url(url):
+    if not isinstance(url, str) or len(url) > 8192:
+        raise PolicyError("Invalid or oversized public URL")
     p = urlsplit(url)
     if p.scheme not in {"http", "https"} or not p.hostname or p.username or p.password:
         raise PolicyError("Only public HTTP(S) URLs without credentials are supported")
@@ -121,7 +123,15 @@ class CollectionContext:
             "sign-in",
             "oauth",
         }
-        if {segment.casefold() for segment in p.path.split("/")} & forbidden or {
+        decoded_path = p.path
+        for _ in range(5):
+            decoded = unquote(decoded_path)
+            if decoded == decoded_path:
+                break
+            decoded_path = decoded
+        else:
+            raise PolicyError("Repeated URL encoding is outside collection scope")
+        if {segment.casefold() for segment in decoded_path.split("/")} & forbidden or {
             key.casefold() for key in parse_qs(p.query)
         } & {"email", "password", "csrf", "submit", "message", "action"}:
             raise PolicyError(
@@ -131,7 +141,7 @@ class CollectionContext:
             if (
                 p.hostname.lower() == rule.get("host", "").lower()
                 and method in rule.get("methods", ["GET"])
-                and p.path.startswith(rule.get("path", "/"))
+                and (p.path or "/").startswith(rule.get("path", "/"))
             ):
                 if method == "POST":
                     # POST is limited to a particular read-only endpoint with
@@ -147,6 +157,8 @@ class CollectionContext:
         from urllib.parse import urljoin
 
         for _ in range(6):
+            if getattr(self, "fence", None):
+                self.fence()
             self.allowed(url, method, body)
             if (
                 self.requests >= self.settings.max_requests
@@ -173,7 +185,7 @@ class CollectionContext:
                         self.bytes += len(chunk)
                         if (
                             size > self.settings.response_bytes
-                            or self.bytes > self.settings.total_bytes
+                            or self.bytes + getattr(self, "cached_bytes", 0) > self.settings.total_bytes
                         ):
                             raise CollectionLimit("Collection response byte budget exhausted")
                         chunks.append(chunk)

@@ -12,6 +12,7 @@ from pathlib import Path
 MAX_FRAME = 8 * 1024 * 1024
 CONFIG = Path("/etc/sjh-connector/images.json")
 SLOTS = asyncio.Semaphore(4)
+BROWSER_SLOT = asyncio.Semaphore(1)
 
 
 def command(kind, image, name):
@@ -66,6 +67,7 @@ def command(kind, image, name):
 
 async def handle(reader, writer):
     proc = None
+    browser_slot = False
     name = "sjh-connector-" + uuid.uuid4().hex
     try:
         header = json.loads(await asyncio.wait_for(reader.readline(), 10))
@@ -79,6 +81,9 @@ async def handle(reader, writer):
         payload = json.dumps(header["payload"]).encode() + b"\n"
         if len(payload) > 256 * 1024:
             raise ValueError("Connector bundle exceeds size limit")
+        if kind == "browser":
+            await asyncio.wait_for(BROWSER_SLOT.acquire(), 600)
+            browser_slot = True
         proc = await asyncio.create_subprocess_exec(
             *command(kind, image, name),
             stdin=asyncio.subprocess.PIPE,
@@ -144,6 +149,8 @@ async def handle(reader, writer):
                 stderr=asyncio.subprocess.DEVNULL,
             )
             await cleanup.wait()
+        if browser_slot:
+            BROWSER_SLOT.release()
         writer.close()
 
 

@@ -33,6 +33,19 @@ def ingest(
         application_url=scraped.extra.get("application_url"),
         requisition_id=scraped.extra.get("requisition_id"),
     )
+    if source:
+        # Canonical compatibility identity is selected by the controller. Agent
+        # labels and requisition IDs cannot replace the source posting identity.
+        from bs4 import BeautifulSoup
+
+        text = scraped.description
+        soup = BeautifulSoup(text, "html.parser")
+        if soup.find(["p", "div", "li", "br", "ul", "ol", "strong", "em", "span"]):
+            text = soup.get_text("\n", strip=True)
+        scraped = replace(
+            scraped, source=source.platform, source_job_id=posting.posting_id, description=text
+        )
+        posting = posting.model_copy(update={"job": scraped})
     namespace = source.namespace if source else f"board:{scraped.source}"
     employer_id = source.employer_id if source else employer_id
     identity = (namespace, posting.posting_id, posting.variant)
@@ -48,7 +61,7 @@ def ingest(
         job = session.get(Job, canonical_id)
     if not job and not source:
         # Preserve existing canonical IDs by exact historical source identity only.
-        predicates = [Job.url == scraped.url]
+        predicates = [Job.url == scraped.url] if scraped.url else []
         if scraped.source_job_id:
             predicates.append(Job.source_job_id == scraped.source_job_id)
         job = session.scalar(
@@ -155,9 +168,21 @@ def ingest(
     if not historical:
         record.availability, record.missing_checks, record.checked_at = "open", 0, now
         job.last_seen_at, job.expired_at, job.expired_reason = now, None, None
-        job.availability_checked_at = now
+        from job_lifecycle import mark_available
+
+        mark_available(job, now)
     if source and scraped.description and not historical:
-        job.description = scraped.description
+        from analyzer.quality import set_description
+
+        set_description(
+            session,
+            job,
+            scraped.description,
+            trusted_detail=scraped.extra.get("description_quality") == "complete",
+            declared=scraped.extra.get("description_quality"),
+            source=namespace,
+            evidence=posting.evidence,
+        )
         if scraped.title:
             job.title = scraped.title
         if scraped.location:
@@ -174,7 +199,17 @@ def ingest(
         and len(scraped.description) > len(job.description or "")
         and board_may_enrich(session, job.id)
     ):
-        job.description = scraped.description
+        from analyzer.quality import set_description
+
+        set_description(
+            session,
+            job,
+            scraped.description,
+            trusted_detail=scraped.extra.get("description_quality") == "complete",
+            declared=scraped.extra.get("description_quality"),
+            source=namespace,
+            evidence=[scraped.url],
+        )
     if (
         previous_canonical is not None
         and canonical_content(job) != previous_canonical
@@ -209,7 +244,9 @@ def ingest_board(scraped, direction=None, profile_ids=None):
     from employers.discovery import observe
 
     with get_session() as session:
-        employer = observe(session, scraped)
+        from employers.config import enabled
+
+        employer = observe(session, scraped) if enabled() else None
         job, created, _ = ingest(
             session,
             scraped,
@@ -224,12 +261,34 @@ def ingest_board(scraped, direction=None, profile_ids=None):
 def job_source_fields(session, job_id, rows=None):
     if rows is None:
         rows = session.scalars(select(JobSource).where(JobSource.job_id == job_id)).all()
-    preferred = next((r for r in rows if r.source_id and r.application_url), None)
+    preferred = next(
+        (
+            r
+            for r in sorted(rows, key=lambda r: r.availability != "open")
+            if r.source_id and r.application_url and r.availability != "closed"
+        ),
+        None,
+    )
+    preferred = preferred or next(
+        (r for r in rows if r.source_id and r.availability != "closed"), None
+    )
+    states = {row.availability for row in rows}
     return {
+        "availability": "open"
+        if "open" in states
+        else "closed"
+        if states == {"closed"}
+        else "unknown",
+        "direct_only": bool(any(r.source_id for r in rows))
+        and not any(not r.source_id for r in rows),
         "sources": [
             {
                 "id": r.id,
                 "namespace": r.namespace,
+                "posting_id": r.posting_id,
+                "variant": r.variant,
+                "requisition_id": r.requisition_id,
+                "application_url": r.application_url,
                 "direct": r.source_id is not None,
                 "url": r.url,
                 "availability": r.availability,
@@ -249,11 +308,18 @@ def job_source_fields(session, job_id, rows=None):
 
 def board_may_enrich(session, job_id):
     """Board detail refreshes cannot replace an authoritative employer description."""
+    job = session.get(Job, job_id)
     return (
-        session.scalar(
-            select(JobSource.id).where(JobSource.job_id == job_id, JobSource.source_id.is_not(None))
+        job is None
+        or job.description_quality != "complete"
+        or (
+            session.scalar(
+                select(JobSource.id).where(
+                    JobSource.job_id == job_id, JobSource.source_id.is_not(None)
+                )
+            )
+            is None
         )
-        is None
     )
 
 

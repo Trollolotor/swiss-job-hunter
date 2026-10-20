@@ -69,7 +69,9 @@ async def verify_and_create(
 ):
     official, portal = public_url(official_url), public_url(portal_url)
     config = get_config()
-    if classification != "direct_employer":
+    if classification != "direct_employer" and not (
+        classification == "agency" and config.include_agencies
+    ):
         raise ValueError("Agency or unresolved employers require review")
     context = CollectionContext([{"host": official.hostname, "path": "/"}], config)
     try:
@@ -93,6 +95,10 @@ async def verify_and_create(
         employer = session.get(Employer, employer_id)
         if not employer:
             raise ValueError("Employer not found")
+        if employer.classification == "agency":
+            if not config.include_agencies:
+                raise ValueError("Agency onboarding is excluded by the current settings")
+            classification = "agency"
         from company_service import normalize_company_name
 
         name = normalize_company_name(employer.name)
@@ -140,7 +146,7 @@ async def verify_and_create(
         )
         session.add(source)
         employer.official_url, employer.resolution_status = official_url, "resolved"
-        employer.classification, employer.confidence = "direct_employer", 1.0
+        employer.classification, employer.confidence = classification, 1.0
         session.add(
             EmployerEvidence(
                 employer_id=employer_id,
@@ -169,8 +175,14 @@ def candidate(
             if len(code.encode()) > 100_000:
                 raise ValueError("Connector code exceeds limit")
             tree = ast.parse(code)
-            if not any(isinstance(n, ast.FunctionDef) and n.name == "collect" for n in tree.body):
-                raise ValueError("Connector must define collect(config, sdk)")
+            functions = {n.name for n in tree.body if isinstance(n, ast.FunctionDef)}
+            if (
+                "collect" not in functions
+                and not {"enumerate", "fetch_detail", "normalize"} <= functions
+            ):
+                raise ValueError(
+                    "Connector must define SDK v1 collect or SDK v2 enumerate/fetch_detail/normalize"
+                )
             if not re.fullmatch(r"sha256:[a-f0-9]{64}", image_digest):
                 raise ValueError(
                     "Generated connector requires a pinned approved runtime image digest"
@@ -179,19 +191,25 @@ def candidate(
         manifest["network_policy"] = (
             policy if policy is not None else json.loads(source.policy_json)
         )
-        if kind=="builtin":
-            manifest["adapter_fingerprint"]=adapter_fingerprint()
+        if kind == "builtin":
+            manifest["adapter_fingerprint"] = adapter_fingerprint()
         if kind == "generated":
             import os
 
             manifest = dict(manifest)
             manifest["browser_image_digest"] = os.environ.get("EMPLOYER_BROWSER_IMAGE", "")
         config = config or json.loads(source.config_json)
+        sdk_version = (
+            "2"
+            if kind == "builtin" or {"enumerate", "fetch_detail", "normalize"} <= functions
+            else "1"
+        )
+        manifest["contract_version"] = sdk_version
         bundle = {
             "code": code,
             "manifest": manifest,
             "config": config,
-            "sdk": SDK_VERSION,
+            "sdk": sdk_version,
             "image": image_digest,
             "kind": kind,
         }
@@ -204,6 +222,7 @@ def candidate(
             parent_id=parent_id,
             image_digest=image_digest,
             digest=digest(bundle),
+            sdk_version=sdk_version,
         )
         session.add(version)
         session.flush()
@@ -216,6 +235,20 @@ async def execute(version, source, context):
     return await collect_generated(version, context)
 
 
+def run_memberships(context, postings):
+    """Keep enumerated identities even when a later detail cannot be retrieved."""
+    identities = {posting.identity for posting in postings}
+    variants = {}
+    for posting in postings:
+        variants.setdefault(posting.posting_id, set()).add(posting.variant)
+    for entry in context.catalogue_entries:
+        if entry.posting_id not in variants or (
+            entry.variant and entry.variant not in variants[entry.posting_id]
+        ):
+            identities.add(entry.identity)
+    return identities
+
+
 async def run_version(version_id, *, validation=False, context_factory=None, fence=None):
     context_factory = context_factory or CollectionContext
     config = get_config()
@@ -224,10 +257,16 @@ async def run_version(version_id, *, validation=False, context_factory=None, fen
         source = session.get(EmployerSource, version.source_id)
         if not source.enabled:
             raise ValueError("Source is paused")
-        if (version.kind=="builtin" and json.loads(version.manifest_json).get("adapter_fingerprint")
-                !=adapter_fingerprint()):
+        if (
+            version.kind == "builtin"
+            and json.loads(version.manifest_json).get("adapter_fingerprint")
+            != adapter_fingerprint()
+        ):
             from employers.runtime import RuntimeUnavailable
-            raise RuntimeUnavailable("Maintained adapter or dependencies changed; retry the source to validate a new version")
+
+            raise RuntimeUnavailable(
+                "Maintained adapter or dependencies changed; retry the source to validate a new version"
+            )
         bundle = {
             "code": version.code,
             "manifest": json.loads(version.manifest_json),
@@ -257,6 +296,14 @@ async def run_version(version_id, *, validation=False, context_factory=None, fen
         ),
         config,
     )
+    context.source_id, context.version_id, context.validation = (
+        source_obj.id,
+        version_id,
+        validation,
+    )
+    context.fence = fence
+    context.catalogue_spec = json.loads(version_obj.manifest_json).get("catalogue", {})
+    context.fresh_detail_keys, context.staged, context.catalogue_entries = set(), [], []
     result = None
     try:
         import asyncio
@@ -264,6 +311,16 @@ async def run_version(version_id, *, validation=False, context_factory=None, fen
         async with asyncio.timeout(config.runtime_seconds):
             result = await execute(version_obj, source_obj, context)
         assessment = assess(result, context.observations, json.loads(version_obj.manifest_json))
+        from employers.validation import complete_description
+
+        for posting in result.postings:
+            posting.job.extra["description_quality"] = (
+                "complete"
+                if complete_description(
+                    posting, context.observations, json.loads(version_obj.manifest_json)
+                )
+                else "preview"
+            )
         # Independently check sampled detail/application URLs for every candidate.
         if validation and assessment["outcome"] in {"complete", "empty"}:
             for posting in result.postings[:3]:
@@ -276,17 +333,30 @@ async def run_version(version_id, *, validation=False, context_factory=None, fen
                 if not live.text.strip():
                     raise ValueError("Vacancy link returned no content")
         ref = artifacts.save(context.observations, assessment["outcome"] in {"failed", "partial"})
-        assessment.update(fixture=ref, requests=context.requests, bytes=context.bytes)
+        assessment.update(
+            fixture=ref,
+            requests=context.requests,
+            bytes=context.bytes,
+            cache_hits=getattr(context, "cache_hits", 0),
+        )
         with get_session() as session:
             run = session.get(SourceRun, run_id)
             source = session.get(EmployerSource, source_obj.id)
             run.outcome, run.finished_at = assessment["outcome"], datetime.utcnow()
             run.stats_json = json.dumps(assessment)
-            for identity in set(result.observed_ids):
+            for identity in run_memberships(context, result.postings):
                 session.add(SourceRunMember(run_id=run_id, identity=identity))
             if fence:
                 fence()
             if not validation:
+                from employers.cache import save
+
+                save(
+                    session,
+                    context,
+                    context.catalogue_entries,
+                    [p for p in result.postings if not posting_errors(p, context.observations)],
+                )
                 _finalize_collection(
                     session,
                     source,
@@ -312,6 +382,44 @@ async def run_version(version_id, *, validation=False, context_factory=None, fen
             run.stats_json = json.dumps(
                 {"fixture": ref, "requests": context.requests, "bytes": context.bytes}
             )
+            if not validation and context.staged:
+                if fence:
+                    fence()
+                from employers.contracts import CollectionResult
+
+                partial = CollectionResult(
+                    postings=context.staged,
+                    observed_ids=list({p.posting_id for p in context.staged}),
+                    diagnostics=[str(exc)[:1000]],
+                )
+                assessment = {
+                    "outcome": "partial",
+                    "errors": [str(exc)[:1000]],
+                    "observed_count": len({entry.posting_id for entry in context.catalogue_entries})
+                    or len(partial.observed_ids),
+                }
+                source = session.get(EmployerSource, source_obj.id)
+                _finalize_collection(
+                    session,
+                    source,
+                    version_id,
+                    scope,
+                    partial,
+                    assessment,
+                    config,
+                    run_id,
+                    context.observations,
+                )
+                run.outcome = "partial"
+                assessment.update(
+                    fixture=ref,
+                    requests=context.requests,
+                    bytes=context.bytes,
+                    cache_hits=getattr(context, "cache_hits", 0),
+                )
+                run.stats_json = json.dumps(assessment)
+            for identity in run_memberships(context, context.staged):
+                session.add(SourceRunMember(run_id=run_id, identity=identity))
         raise
     finally:
         await context.close()
@@ -321,6 +429,9 @@ def _finalize_collection(
     session, source, version_id, scope, result, assessment, config, run_id, observations
 ):
     if not source.enabled or source.active_version_id != version_id:
+        return
+    current = get_config()
+    if current.coverage != config.coverage or (current.shadow and not config.shadow):
         return
     now = datetime.utcnow()
     complete = assessment["outcome"] in {"complete", "empty"}
@@ -368,24 +479,14 @@ def _finalize_collection(
             if posting_errors(posting, observations):
                 continue
             job, _, record = ingest(session, posting.job, source=source, posting=posting)
-            from analyzer.scorer import fast_score
+            from analyzer.matching import local_evaluate
 
             for profile in active_profiles:
-                if not session.get(JobProfile, (job.id, profile.id)):
-                    score = fast_score(profile.cv_text, job.description)
-                    session.add(
-                        JobProfile(
-                            job_id=job.id,
-                            profile_id=profile.id,
-                            match_score=score.score,
-                            match_explanation=score.explanation,
-                            screened_at=now,
-                        )
-                    )
+                local_evaluate(session, job, profile)
         if complete:
-            observed = set(result.observed_ids)
+            observed = {p.identity for p in result.postings}
             for row in session.scalars(select(JobSource).where(JobSource.source_id == source.id)):
-                if row.posting_id in observed:
+                if json.dumps([row.posting_id, row.variant], separators=(",", ":")) in observed:
                     row.missing_checks, row.availability, row.checked_at = 0, "open", now
                     continue
                 if row.missing_scope != scope or row.missing_checks == 0:
@@ -407,10 +508,14 @@ def _finalize_collection(
                             "All monitored sources confirmed closure",
                         )
     if complete:
+        if not config.shadow and source.baseline_at is None:
+            # Ingestion timestamps are assigned inside the loop above. The
+            # baseline must follow them so initial catalogue jobs are excluded.
+            source.baseline_at = datetime.utcnow()
         source.last_success_at, source.health, source.last_error = now, "active", None
     else:
         source.health, source.last_error = "degraded", "; ".join(assessment["errors"])[:2000]
-    source.next_due_at = now + timedelta(hours=config.poll_hours)
+    source.next_due_at = now + timedelta(hours=source.poll_hours or config.poll_hours)
 
 
 async def validate_activate(version_id, *, context_factory=None, fence=None):
@@ -420,14 +525,22 @@ async def validate_activate(version_id, *, context_factory=None, fence=None):
         source_id = version.source_id
         expected_active = session.get(EmployerSource, source_id).active_version_id
     try:
-        first = await run_version(version_id, validation=True, context_factory=context_factory)
-        second = await run_version(version_id, validation=True, context_factory=context_factory)
+        first = await run_version(
+            version_id, validation=True, context_factory=context_factory, fence=fence
+        )
+        second = await run_version(
+            version_id, validation=True, context_factory=context_factory, fence=fence
+        )
         with get_session() as session:
             version = session.get(ConnectorVersion, version_id)
             report = {"first": first, "second": second, "repeatable": repeatable(first, second)}
             version.validation_json = json.dumps(report)
         if not report["repeatable"]:
-            raise ValueError("Candidate failed completeness or stable identity validation")
+            failures = list(dict.fromkeys(first.get("errors", []) + second.get("errors", [])))
+            raise ValueError(
+                "Candidate failed completeness or stable identity validation: "
+                + "; ".join(failures[:5])[:1200]
+            )
         # Replay saved observations through the same code and trusted validator.
         from employers.replay import replay_context
 
@@ -436,6 +549,7 @@ async def validate_activate(version_id, *, context_factory=None, fence=None):
                 version_id,
                 validation=True,
                 context_factory=replay_context(artifacts.load(item["fixture"])),
+                fence=fence,
             )
             if not repeatable(item, replayed):
                 raise ValueError("Candidate failed saved-fixture replay")

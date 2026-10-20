@@ -19,6 +19,7 @@ from db.models import (
     EmployerTask,
     JobProfile,
     JobSource,
+    SearchProfile,
     SourceRun,
 )
 from db.session import engine, get_session, init_db
@@ -37,7 +38,7 @@ def schema_ready():
     with engine.connect() as c:
         return (
             c.execute(text("SELECT version_num FROM alembic_version")).scalar()
-            == "20261020_employer_sources"
+            == "20261021_agent_optimization"
         )
 
 
@@ -59,8 +60,19 @@ def save_settings(body: EmployerSettings):
     init_db()
     if body.enabled and not schema_ready():
         raise HTTPException(409, "Run alembic upgrade head before enabling employer sources")
+    previous = get_config()
     put_setting("employer_sources", body.model_dump())
     with get_session() as session:
+        if not body.enabled:
+            session.execute(update(EmployerTask).where(EmployerTask.status.in_(
+                ["queued", "running", "budget_wait"])).values(status="cancelled", token=None))
+        if body.coverage != previous.coverage or body.shadow != previous.shadow:
+            from db.models import JobSource
+            session.execute(update(EmployerTask).where(
+                EmployerTask.kind.in_(["collect", "health"]), EmployerTask.status == "running"
+            ).values(status="cancelled", token=None))
+            session.execute(update(JobSource).where(JobSource.source_id.is_not(None)).values(
+                missing_checks=0, missing_scope=None))
         if body.daily_budget_usd:
             session.execute(
                 update(EmployerTask)
@@ -119,8 +131,23 @@ def list_employers(q: str = "", offset: int = 0, limit: int = 50):
         ]
 
 
+@router.put("/employer-sources/{source_id}/schedule")
+def update_source_schedule(source_id: int, body: dict):
+    interval = body.get("poll_hours")
+    if interval is not None and (isinstance(interval, bool) or not isinstance(interval, int) or not 2 <= interval <= 4):
+        raise HTTPException(422, "poll_hours must be 2, 3, 4, or null for the default")
+    with get_session() as session:
+        source = session.get(EmployerSource, source_id)
+        if not source:
+            raise HTTPException(404, "Source not found")
+        source.poll_hours = interval
+        return {"source_id": source_id, "poll_hours": interval}
+
+
 @router.get("/employers/operations")
 def operations():
+    from employers.metrics import source_metrics
+    from analyzer.config import get_config as matching_config
     init_db()
     with get_session() as session:
         day = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
@@ -129,7 +156,7 @@ def operations():
                 BudgetLedger.operation,
                 func.sum(func.coalesce(BudgetLedger.actual_usd, BudgetLedger.reserved_usd)),
             )
-            .filter(BudgetLedger.created_at >= day)
+            .filter(BudgetLedger.created_at >= day, BudgetLedger.category == "employer")
             .group_by(BudgetLedger.operation)
             .all()
         )
@@ -160,13 +187,16 @@ def operations():
             "relevant_direct_vacancies": session.query(func.count(func.distinct(JobProfile.job_id)))
             .filter(
                 JobProfile.job_id.in_(direct_ids),
-                JobProfile.match_score >= 0.3,
+                JobProfile.profile_id.in_(select(SearchProfile.id).where(SearchProfile.active.is_(True))),
+                JobProfile.match_score >= matching_config().shortlist_threshold,
+                JobProfile.score_method == "llm",
                 JobProfile.score_stale.is_(False),
             )
             .scalar()
             or 0,
         }
         return {
+            "value": source_metrics(session),
             "metrics": metrics,
             "tasks": [
                 row_dict(t)
@@ -183,7 +213,7 @@ def operations():
             "budget": [
                 row_dict(t)
                 for t in session.scalars(
-                    select(BudgetLedger).order_by(BudgetLedger.id.desc()).limit(30)
+                    select(BudgetLedger).where(BudgetLedger.category == "employer").order_by(BudgetLedger.id.desc()).limit(30)
                 )
             ],
         }
@@ -272,6 +302,24 @@ def source_detail(source_id: int):
         }
 
 
+@router.post("/employer-sources/{source_id}/versions/{version_id}/validate")
+def validate_version(source_id: int, version_id: int):
+    with get_session() as session:
+        source = session.get(EmployerSource, source_id)
+        version = session.get(ConnectorVersion, version_id)
+        if not source or not version or version.source_id != source_id:
+            raise HTTPException(404, "Source connector version not found")
+        if not source.enabled:
+            raise HTTPException(409, "Resume the source before validating")
+        session.execute(update(EmployerTask).where(
+            EmployerTask.source_id == source_id,
+            EmployerTask.kind.in_(["repair", "onboard"]),
+            EmployerTask.status == "queued"
+        ).values(status="cancelled", token=None,
+                 error="Superseded by explicit validation of an existing immutable version"))
+    return {"task_id":enqueue("validate", source_id=source_id, payload={"version_id":version_id})}
+
+
 @router.post("/employer-sources/{source_id}/{action}")
 def source_action(
     source_id: int, action: Literal["pause", "resume", "retry", "collect", "rollback"]
@@ -295,14 +343,15 @@ def source_action(
         if action in {"resume", "retry"}:
             source.enabled = True
             source.health = "pending"
-            for incident in session.scalars(
-                select(ConnectorIncident).where(
-                    ConnectorIncident.source_id == source_id,
-                    ConnectorIncident.status.in_(["open", "needs_review"]),
-                )
-            ):
-                # Explicit retry closes the incident; future faults get a new audit.
-                incident.status = "manually_retried"
+            if action == "retry":
+                for incident in session.scalars(
+                    select(ConnectorIncident).where(
+                        ConnectorIncident.source_id == source_id,
+                        ConnectorIncident.status.in_(["open", "needs_review"]),
+                    )
+                ):
+                    # Only explicit Retry starts a new audit; resume preserves limits.
+                    incident.status = "manually_retried"
         elif not source.enabled:
             raise HTTPException(409, "Resume the source before collecting")
         if action == "rollback":

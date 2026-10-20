@@ -5,3 +5,5 @@ services:
       - /run/sjh-connector:/run/sjh-connector
     environment:
       EMPLOYER_LAUNCHER_SOCKET: /run/sjh-connector/launcher.sock
+      EMPLOYER_RUNNER_IMAGE: ${EMPLOYER_RUNNER_IMAGE:-}
+      EMPLOYER_BROWSER_IMAGE: ${EMPLOYER_BROWSER_IMAGE:-}

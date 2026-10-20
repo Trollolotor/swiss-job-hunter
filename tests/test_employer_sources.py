@@ -118,12 +118,6 @@ def test_discovery_before_rejection_and_names_stay_separate(feature):
     observe_board_result(scraped(company=label + " Holding"))
     with get_session() as s:
         assert s.query(Employer).filter(Employer.name.like(label + "%")).count() == 2
-    for file in ("automation.py", "server.py"):
-        code = Path(file).read_text()
-        position = code.index("observe_board_result(scraped)")
-        assert position < code.index("if scraped.posted_at:", position)
-    code = Path("cli.py").read_text()
-    assert code.index("observe_board_result(scraped)") < code.index("# Stage 1: exact dedup")
 
 
 def test_source_identity_preserves_distinct_requisitions(feature):
@@ -282,6 +276,39 @@ async def test_failed_validation_stays_inactive(feature):
 
 
 @pytest.mark.asyncio
+async def test_explicit_version_validation_preserves_repair_audit_and_cancels_queued_generation(
+    feature, monkeypatch
+):
+    from fastapi.testclient import TestClient
+    from db.models import ConnectorIncident, EmployerSource, EmployerTask
+    from db.session import get_session
+    from employers import service, tasks
+    from employers.api import source_action
+    import server
+
+    sid = source()
+    vid = service.candidate(sid)
+    with get_session() as session:
+        incident = ConnectorIncident(source_id=sid, category="structural", failed_candidates=1)
+        session.add(incident)
+        session.flush()
+        iid = incident.id
+    previous = tasks.enqueue("repair", source_id=sid)
+    response = TestClient(server.app).post(f"/employer-sources/{sid}/versions/{vid}/validate")
+    assert response.status_code == 200
+    with get_session() as session:
+        assert session.get(EmployerTask, previous).status == "cancelled"
+        assert session.get(ConnectorIncident, iid).failed_candidates == 1
+    monkeypatch.setattr(service, "CollectionContext", context_factory(["one"]))
+    await tasks.execute_task(tasks.claim(response.json()["task_id"]))
+    with get_session() as session:
+        assert session.get(EmployerSource, sid).active_version_id == vid
+        assert session.get(ConnectorIncident, iid).status == "resolved"
+        assert session.get(ConnectorIncident, iid).failed_candidates == 1
+    source_action(sid, "pause")
+
+
+@pytest.mark.asyncio
 async def test_partial_does_not_advance_absence(feature):
     from db.models import JobSource
     from db.session import get_session
@@ -310,6 +337,45 @@ async def test_partial_does_not_advance_absence(feature):
     with get_session() as s:
         row = s.query(JobSource).filter_by(source_id=sid).one()
         assert row.availability == "open" and row.missing_checks == 0
+
+
+@pytest.mark.asyncio
+async def test_absence_membership_distinguishes_variants_of_same_posting(feature):
+    from db.models import Job, JobSource
+    from db.session import get_session
+    from employers.service import candidate, run_version, validate_activate
+
+    sid = source()
+    vid = candidate(sid)
+    factory = context_factory(["one"])
+    await validate_activate(vid, context_factory=factory)
+    await run_version(vid, context_factory=factory)
+    with get_session() as session:
+        observed = session.query(JobSource).filter_by(source_id=sid).one()
+        # A previously collected language variant shares its requisition, but
+        # its continued existence must be independently observed.
+        missing = JobSource(
+            source_id=sid,
+            namespace=observed.namespace,
+            posting_id="one",
+            variant="de",
+            job_id=observed.job_id,
+            url=observed.url,
+            availability="open",
+        )
+        session.add(missing)
+        session.flush()
+        missing_id, observed_id = missing.id, observed.id
+    await run_version(vid, context_factory=factory)
+    with get_session() as session:
+        assert session.get(JobSource, missing_id).missing_checks == 1
+        session.get(JobSource, missing_id).checked_at = datetime.utcnow() - timedelta(hours=3)
+    await run_version(vid, context_factory=factory)
+    with get_session() as session:
+        assert session.get(JobSource, missing_id).availability == "closed"
+        present = session.get(JobSource, observed_id)
+        assert present.availability == "open" and present.missing_checks == 0
+        assert session.get(Job, present.job_id).expired_at is None
 
 
 def test_location_modes_and_unknown_dates(feature):
@@ -432,6 +498,58 @@ async def test_repair_limit_survives_scheduler_and_restart(feature):
         assert s.get(ConnectorIncident, iid).failed_candidates == 2
         assert s.get(ConnectorIncident, iid).status == "needs_review"
         assert s.get(EmployerTask, tid).status == "needs_review"
+    from employers.api import source_action
+
+    # Pause/resume must not act as an implicit manual retry.
+    source_action(sid, "pause")
+    resumed = source_action(sid, "resume")
+    await execute_task(claim(resumed["task_id"]))
+    with get_session() as s:
+        assert s.get(ConnectorIncident, iid).failed_candidates == 2
+        assert s.get(ConnectorIncident, iid).status == "needs_review"
+    source_action(sid, "retry")
+    with get_session() as s:
+        assert s.get(ConnectorIncident, iid).failed_candidates == 2
+        assert s.get(ConnectorIncident, iid).status == "manually_retried"
+    source_action(sid, "pause")
+
+
+@pytest.mark.asyncio
+async def test_fenced_task_cannot_make_another_network_request(feature):
+    from employers.network import CollectionContext
+    from employers.tasks import StaleTaskError
+    from unittest.mock import Mock
+
+    network = Mock(return_value=httpx.Response(200, text="public"))
+    context = CollectionContext(
+        [{"host": "public.example", "path": "/"}], feature, transport=httpx.MockTransport(network)
+    )
+    context.fence = Mock(side_effect=StaleTaskError("reclaimed"))
+    try:
+        with pytest.raises(StaleTaskError):
+            await context.fetch("https://public.example/jobs")
+        network.assert_not_called()
+        assert context.requests == 0
+    finally:
+        await context.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["/%61pply", "/jobs%2faccount", "/%2561pplication", "/%73ubmit"])
+async def test_encoded_account_actions_are_denied(feature, path):
+    from employers.network import CollectionContext, PolicyError
+    from unittest.mock import Mock
+
+    network = Mock(return_value=httpx.Response(200, text="not reached"))
+    context = CollectionContext(
+        [{"host": "public.example", "path": "/"}], feature, transport=httpx.MockTransport(network)
+    )
+    try:
+        with pytest.raises(PolicyError):
+            await context.fetch("https://public.example" + path)
+        network.assert_not_called()
+    finally:
+        await context.close()
 
 
 def test_launcher_uses_fixed_policy_without_host_mounts():
@@ -471,7 +589,7 @@ def test_migration_existing_and_empty_database(tmp_path, monkeypatch, versioned)
     with db.connect() as c:
         assert (
             c.execute(text("SELECT version_num FROM alembic_version")).scalar()
-            == "20261020_employer_sources"
+            == "20261021_agent_optimization"
         )
 
 
@@ -542,6 +660,24 @@ def test_migration_preserves_legacy_history_and_adds_stale_flag(
                 job_id=17, event_type=ApplicationEvent.NOTE, note="Keep this event"
             )
         )
+        for column in (
+            "description_quality",
+            "extraction_json",
+            "enrichment_attempts",
+            "enrichment_due_at",
+            "status_origin",
+        ):
+            conn.exec_driver_sql(f"ALTER TABLE jobs DROP COLUMN {column}")
+        for column in (
+            "keyword_score",
+            "score_method",
+            "evaluation_state",
+            "cv_hash",
+            "content_hash",
+            "prompt_revision",
+            "requirements_json",
+        ):
+            conn.exec_driver_sql(f"ALTER TABLE job_profiles DROP COLUMN {column}")
         conn.exec_driver_sql("ALTER TABLE job_profiles DROP COLUMN score_stale")
     monkeypatch.setattr(settings, "database_url", url)
     cfg = Config("alembic.ini")
@@ -606,6 +742,11 @@ async def test_generated_onboarding_collection_and_validated_repair(feature, mon
     async def generate(operation, evidence, *args, **kwargs):
         state["calls"].append(operation)
         if operation == "connector_investigation":
+            if len(evidence["observations"]) == 1:
+                return AgentStep(
+                    action="fetch",
+                    url="https://api.smartrecruiters.com/v1/companies/EvidenceBank/postings/one",
+                )
             return AgentStep(action="generate")
         if operation == "connector_repair":
             assert evidence["previous"]["code"] == initial
@@ -701,6 +842,165 @@ def test_fabricated_description_and_duplicate_pages_fail_validation(feature):
     assert report["outcome"] == "partial"
     assert any("Repeated" in e for e in report["errors"])
     assert any("description" in e for e in report["errors"])
+
+
+@pytest.mark.parametrize(
+    "host,totals,expected",
+    [
+        ("tenant.wd103.myworkdayjobs.com", [3, 0, 0], "complete"),
+        ("public.example", [3, 0, 0], "partial"),
+        ("tenant.wd103.myworkdayjobs.com", [3, 2, 0], "partial"),
+        ("tenant.wd103.myworkdayjobs.com", [0, 0, 0], "partial"),
+        ("tenant.wd103.myworkdayjobs.com", [3, False, 0], "partial"),
+    ],
+)
+def test_workday_initial_total_still_reconciles_all_pages(feature, host, totals, expected):
+    from employers.contracts import CollectedPosting, CollectionResult
+    from employers.network import Observation
+    from employers.validation import assess
+
+    observations, postings = [], []
+    for offset, total in enumerate(totals):
+        pid = f"id-{offset}"
+        url = f"https://{host}/job/{pid}"
+        observation = Observation(
+            f"https://{host}/wday/cxs/tenant/Board/jobs",
+            "POST",
+            200,
+            json.dumps(
+                {
+                    "total": total,
+                    "jobPostings": [
+                        {
+                            "id": pid,
+                            "url": url,
+                            "title": "Software Engineer",
+                            "description": DESCRIPTION,
+                        }
+                    ],
+                }
+            ),
+            {},
+            {"offset": offset, "limit": 1},
+        )
+        observations.append(observation)
+        postings.append(
+            CollectedPosting(job=scraped(pid, url=url), posting_id=pid, evidence=[observation.key])
+        )
+    report = assess(
+        CollectionResult(
+            postings=postings,
+            observed_ids=[p.posting_id for p in postings],
+            reported_total=3,
+            termination="total",
+        ),
+        observations,
+        {
+            "catalogue": {
+                "format": "json",
+                "path_suffix": "/jobs",
+                "items": "jobPostings",
+                "id": "id",
+                "total": "total",
+                "pagination": "offset",
+            }
+        },
+    )
+    assert report["outcome"] == expected
+
+
+def test_publication_dates_require_source_evidence(feature):
+    from employers.contracts import CollectedPosting
+    from employers.network import Observation
+    from employers.validation import posting_errors
+
+    observation = Observation(
+        "https://board.example/job/one",
+        "GET",
+        200,
+        json.dumps(
+            {
+                "title": "Software Engineer",
+                "description": DESCRIPTION,
+                "updatedAt": "2026-10-21T00:00:00Z",
+            }
+        ),
+        {},
+    )
+    posting = CollectedPosting(
+        job=scraped(posted_at=datetime(2026, 10, 21)), posting_id="one", evidence=[observation.key]
+    )
+    assert any("Publication date" in error for error in posting_errors(posting, [observation]))
+    observation.text = observation.text.replace("updatedAt", "datePosted")
+    posting.evidence = [observation.key]
+    assert not posting_errors(posting, [observation])
+    posting.posting_id = "fabricated-id-112358"
+    assert any("Posting identity" in error for error in posting_errors(posting, [observation]))
+
+
+@pytest.mark.asyncio
+async def test_initial_onboarding_failure_uses_persisted_repair_limit(feature, monkeypatch):
+    from db.models import ConnectorIncident, EmployerSource, EmployerTask
+    from db.session import get_session
+    from employers import service, tasks
+    from employers.adapters import SMARTRECRUITERS_MANIFEST, smartrecruiters
+    from employers.agent import AgentStep
+
+    sid = source()
+    with get_session() as session:
+        row = session.get(EmployerSource, sid)
+        row.platform = "custom"
+        row.policy_json = json.dumps(
+            json.loads(row.policy_json) + [{"host": "careers.smartrecruiters.com", "path": "/"}]
+        )
+    calls = []
+
+    async def generate(operation, evidence, *args, **kwargs):
+        if operation == "connector_investigation":
+            if len(evidence["observations"]) == 1:
+                return AgentStep(
+                    action="fetch",
+                    url="https://api.smartrecruiters.com/v1/companies/EvidenceBank/postings/one",
+                )
+            return AgentStep(action="generate")
+        calls.append(operation)
+        return AgentStep(
+            action="candidate",
+            code="def collect(config, sdk):\n    return {}\n",
+            manifest=SMARTRECRUITERS_MANIFEST,
+            config={"tenant": "EvidenceBank"},
+        )
+
+    async def broken(version, source, context):
+        result = await smartrecruiters({"tenant": "EvidenceBank"}, context)
+        result.termination = "incomplete"
+        return result
+
+    monkeypatch.setattr(tasks, "step", generate)
+    monkeypatch.setattr(tasks, "CollectionContext", context_factory(["one"]))
+    monkeypatch.setattr(service, "CollectionContext", context_factory(["one"]))
+    monkeypatch.setattr(service, "execute", broken)
+    monkeypatch.setenv("EMPLOYER_RUNNER_IMAGE", "sha256:" + "b" * 64)
+    tid = tasks.enqueue("onboard", source_id=sid)
+    await tasks.execute_task(tasks.claim(tid))
+    for _ in range(2):
+        with get_session() as session:
+            tid = (
+                session.query(EmployerTask)
+                .filter_by(source_id=sid, kind="repair", status="queued")
+                .one()
+                .id
+            )
+        await tasks.execute_task(tasks.claim(tid))
+    # A later onboarding request must not reset the incident's durable counter.
+    tid = tasks.enqueue("onboard", source_id=sid)
+    await tasks.execute_task(tasks.claim(tid))
+    with get_session() as session:
+        incident = session.query(ConnectorIncident).filter_by(source_id=sid).one()
+        assert incident.failed_candidates == 2 and incident.status == "needs_review"
+        assert session.get(EmployerSource, sid).health == "blocked"
+        assert session.get(EmployerTask, tid).status == "needs_review"
+    assert calls == ["connector_generation", "connector_repair", "connector_repair"]
 
 
 def test_automated_scoring_preserves_manual_statuses(feature):

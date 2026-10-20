@@ -13,6 +13,7 @@ class EmployerSettings(BaseModel):
     poll_hours: int = Field(default=3, ge=2, le=168)
     concurrency: int = Field(default=2, ge=1, le=4)
     onboarding_per_day: int = Field(default=3, ge=0, le=100)
+    include_agencies: bool = False
     max_connected: int = Field(default=10, ge=1, le=1000)
     daily_budget_usd: float | None = Field(default=None, gt=0, le=1000)
     repair_budget_fraction: float = Field(default=0.3, ge=0, le=1)

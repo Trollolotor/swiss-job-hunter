@@ -49,7 +49,7 @@ def reserve(operation, model, prompt, max_tokens, task_id=None, search=False):
         rows = conn.execute(
             select(
                 BudgetLedger.operation, BudgetLedger.reserved_usd, BudgetLedger.actual_usd
-            ).where(BudgetLedger.created_at >= start)
+            ).where(BudgetLedger.created_at >= start, BudgetLedger.category == "employer")
         ).all()
         total = sum(r.actual_usd if r.actual_usd is not None else r.reserved_usd for r in rows)
         repair = operation == "connector_repair"
@@ -87,6 +87,15 @@ def settle(identifier, usage, metadata):
         # Provider total includes search where available. Retain a conservative
         # reservation when billing metadata is absent rather than assuming zero.
         value = usage.get("cost")
-        if isinstance(value, (float, int)) and math.isfinite(value) and value >= 0:
+        if (not metadata.get("search_enabled") and isinstance(value, (float, int))
+                and math.isfinite(value) and value >= 0):
             row.actual_usd = value
         row.status = "settled"
+
+
+def fail(identifier, error):
+    with get_session() as session:
+        row = session.get(BudgetLedger, identifier)
+        metadata = json.loads(row.metadata_json or "{}")
+        metadata["error"] = f"{type(error).__name__}: {error}"[:1000]
+        row.metadata_json, row.status = json.dumps(metadata), "failed"
