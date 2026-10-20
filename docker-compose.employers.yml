@@ -1,0 +1,7 @@
+# Explicit optional overlay after installing the fixed-policy host launcher.
+services:
+  backend:
+    volumes:
+      - /run/sjh-connector:/run/sjh-connector
+    environment:
+      EMPLOYER_LAUNCHER_SOCKET: /run/sjh-connector/launcher.sock

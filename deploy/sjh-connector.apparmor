@@ -1,0 +1,27 @@
+#include <tunables/global>
+profile sjh-connector-python flags=(attach_disconnected,mediate_deleted) {
+  #include <abstractions/base>
+  file,
+  deny network inet,
+  deny network inet6,
+  deny /proc/sys/** w,
+  deny /sys/** w,
+  deny /var/run/docker.sock rw,
+}
+profile sjh-connector-browser flags=(attach_disconnected,mediate_deleted) {
+  #include <abstractions/base>
+  file,
+  network unix,
+  # Chromium needs this inside its new unprivileged user namespace. The outer
+  # container still has --cap-drop ALL and cannot gain host capabilities.
+  capability sys_admin,
+  capability sys_chroot,
+  userns,
+  signal,
+  ptrace (trace,read,tracedby,readby) peer=sjh-connector-browser,
+  deny network inet,
+  deny network inet6,
+  deny /proc/sys/** w,
+  deny /sys/** w,
+  deny /var/run/docker.sock rw,
+}

@@ -19,6 +19,10 @@ LLM_OPERATIONS = (
     "translation",
     "cv_tailoring",
     "cover_letter",
+    "employer_resolution",
+    "connector_investigation",
+    "connector_generation",
+    "connector_repair",
 )
 
 DEFAULT_LLM_CONFIG: dict[str, Any] = {

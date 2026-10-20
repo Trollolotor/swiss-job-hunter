@@ -424,7 +424,7 @@ function TrackerBoard({ onSelectJob }) {
                             )}
                             <Timeline jobId={j.id} onRefresh={load}/>
                             <div style={{marginTop:10}}>
-                              <a href={j.url} target="_blank" rel="noreferrer" style={{
+                              <a href={j.application_url||j.url} target="_blank" rel="noreferrer" style={{
                                 fontSize:9,color:"#2e7d52",textDecoration:"none",
                               }}>↗ open listing</a>
                             </div>
@@ -1091,7 +1091,8 @@ export default function App() {
                             color:"#fff",background:"#2e7d52",padding:"1px 4px",borderRadius:2,letterSpacing:"0.06em"}}>
                             {j.direction.toUpperCase()}</span>}
                           <div style={{fontSize:8,color:"#6b8c7a",fontFamily:"monospace"}}>
-                            {j.source?.replace(/\.(ch|com)/,"")}
+                            {j.sources?.some(s=>s.direct)?"DIRECT":j.source?.replace(/\.(ch|com)/,"")}
+                            {j.score_stale&&<span style={{display:"block",color:"#a56b10"}}>UPDATED · RESCORE</span>}
                           </div>
                         </div>
                         <button onClick={e=>{e.stopPropagation();deleteJob(j.id);}} title="Delete"
@@ -1189,11 +1190,12 @@ export default function App() {
                         </div>
 
                         <div style={{display:"flex",flexDirection:"column",gap:7,marginBottom:14}}>
-                          <a href={selected.url} target="_blank" rel="noreferrer" style={{
+                          {selected.score_stale&&<div style={{fontSize:11,color:"#a56b10"}}>Requirements changed. Refresh matching scores before relying on the previous match.</div>}
+                          <a href={selected.application_url||selected.url} target="_blank" rel="noreferrer" style={{
                             display:"block",padding:"7px 12px",borderRadius:4,
                             background:"#d4dece",color:"#2e7d52",fontSize:10,
                             textDecoration:"none",textAlign:"center",border:"1px solid #2e7d5220",
-                          }}>↗ OPEN ORIGINAL LISTING</a>
+                          }}>{selected.application_url?"↗ EMPLOYER APPLICATION PAGE":"↗ OPEN ORIGINAL LISTING"}</a>
                           <Btn onClick={()=>generateCover(selected)} loading={loading.cover}
                             label="GENERATE COVER LETTER" icon="✍" color="#a78bfa"/>
                           <Btn onClick={()=>tailorCv(selected)} loading={loading.tailor}

@@ -1,10 +1,11 @@
 import { useEffect, useState } from "react";
 import TagEditor from "./TagEditor";
+import EmployerSourcesView from "./EmployerSourcesView";
 
 const box={background:"#f0f3ed",border:"1px solid #d4dece",borderRadius:6,padding:16};
 const input={width:"100%",padding:"7px 9px",border:"1px solid #c8d8c4",borderRadius:4,fontFamily:"monospace",fontSize:11};
 const button={padding:"7px 12px",border:"1px solid #2e7d5240",borderRadius:4,background:"#2e7d5212",color:"#2e7d52",fontFamily:"monospace",fontWeight:700,cursor:"pointer"};
-const OPERATIONS=["cv_parsing","keyword_extraction","job_screening","company_summary","translation","cv_tailoring","cover_letter"];
+const OPERATIONS=["cv_parsing","keyword_extraction","job_screening","company_summary","translation","cv_tailoring","cover_letter","employer_resolution","connector_investigation","connector_generation","connector_repair"];
 const SECTIONS=[
   ["about","About"],["experience","Experience"],["education","Education"],
   ["projects","Projects"],["skills","Skills"],["certifications","Certifications"],
@@ -163,7 +164,8 @@ export default function SettingsView({api,onProfilesChanged}) {
     </section>
 
     <div style={{display:"flex",flexDirection:"column",gap:16}}>
-      <div style={{display:"flex",gap:6}}>{[["ai","AI ROUTING"],["prompts","PROMPTS"],["automation","AUTOMATION"],["priority","PRIORITY"]].map(([id,label])=><button key={id} style={{...button,background:panel===id?"#2e7d5225":"transparent"}} onClick={()=>setPanel(id)}>{label}</button>)}</div>
+      <div style={{display:"flex",gap:6}}>{[["ai","AI ROUTING"],["prompts","PROMPTS"],["automation","AUTOMATION"],["priority","PRIORITY"],["employers","EMPLOYER SOURCES"]].map(([id,label])=><button key={id} style={{...button,background:panel===id?"#2e7d5225":"transparent"}} onClick={()=>setPanel(id)}>{label}</button>)}</div>
+      {panel==="employers"&&<EmployerSourcesView api={api}/>}
       {panel==="ai"&&<section style={box}>
         <div style={{fontWeight:800}}>OPENROUTER ROUTING</div>
         <div style={{fontSize:10,color:llm.openrouter_configured?"#2e7d52":"#c0392b",marginBottom:10}}>API key: {llm.openrouter_configured?"configured":"missing in environment"}</div>
@@ -175,7 +177,7 @@ export default function SettingsView({api,onProfilesChanged}) {
             <span style={{fontSize:10}}>{op}</span>
             <input style={input} placeholder="use default" value={llm.operations?.[op]?.model||""} onChange={e=>setLlm({...llm,operations:{...llm.operations,[op]:{...llm.operations[op],model:e.target.value}}})}/>
             <input style={input} placeholder="comma-separated / global" value={(llm.operations?.[op]?.fallbacks||[]).join(", ")} onChange={e=>setLlm({...llm,operations:{...llm.operations,[op]:{...llm.operations[op],fallbacks:e.target.value.split(",").map(x=>x.trim()).filter(Boolean)}}})}/>
-            <button style={button} onClick={()=>testModel(op)}>TEST</button>
+            <button style={button} disabled={op.startsWith("employer_")||op.startsWith("connector_")} onClick={()=>testModel(op)}>TEST</button>
           </div>)}
         </div>
         <div style={{display:"flex",gap:8,marginTop:12}}>{["timeout","retries","concurrency"].map(k=><label key={k} style={{fontSize:10}}>{k}<input type="number" style={{...input,width:90}} value={llm[k]} onChange={e=>setLlm({...llm,[k]:Number(e.target.value)})}/></label>)}</div>

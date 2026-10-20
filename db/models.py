@@ -189,6 +189,7 @@ class JobProfile(Base):
     match_score: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     match_explanation: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     screened_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    score_stale: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
 
 
 class AppSetting(Base):
@@ -322,3 +323,11 @@ class JobEvent(Base):
 
     def __repr__(self) -> str:
         return f"<JobEvent job={self.job_id} type={self.event_type} at={self.occurred_at}>"
+
+
+# Register additive employer-source tables in the same metadata and import API.
+from db.employer_models import (  # noqa: E402,F401
+    BudgetLedger, ConnectorIncident, ConnectorVersion, Employer, EmployerAlias,
+    EmployerEvidence, EmployerSource, EmployerTask, JobSource, JobSourceRevision,
+    SourceRun, SourceRunMember,
+)

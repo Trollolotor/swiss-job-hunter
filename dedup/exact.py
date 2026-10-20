@@ -40,6 +40,11 @@ def get_or_create_job(
     The returned Job is expunged from the session so it can be safely
     used after the session closes — no DetachedInstanceError.
     """
+    from employers.config import enabled
+    if enabled():
+        from employers.ingestion import ingest_board
+        return ingest_board(scraped, direction, profile_ids)
+
     h = Job.make_dedup_hash(
         _normalize(scraped.title),
         _normalize(scraped.company),
@@ -47,7 +52,13 @@ def get_or_create_job(
     )
 
     with get_session() as session:
-        existing = session.query(Job).filter(Job.dedup_hash == h).first()
+        # Preserve canonical IDs when the optional mode is later disabled or the
+        # application is rolled back to board-only operation.
+        from db.models import JobSource
+        observation=session.query(JobSource).filter_by(namespace=f"board:{scraped.source}",
+            posting_id=scraped.source_job_id or scraped.url,variant="").first()
+        existing=session.get(Job,observation.job_id) if observation and observation.job_id else None
+        existing = existing or session.query(Job).filter(Job.dedup_hash == h).first()
         if existing:
             new_confidence = scraped.posted_at_confidence or _date_confidence(scraped.posted_at_source)
             old_confidence = existing.posted_at_confidence or _date_confidence(existing.posted_at_source)

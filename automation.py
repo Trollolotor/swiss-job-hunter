@@ -8,6 +8,7 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import func, or_
+from job_lifecycle import set_scored_status
 
 _scheduler = None
 _tasks: set[asyncio.Task] = set()
@@ -188,6 +189,8 @@ async def _execute(run_id: int) -> None:
                         async for scraped in scraper.scrape(
                             keyword, location, config["pages_per_source"]
                         ):
+                            from employers.discovery import observe_board_result
+                            observe_board_result(scraped)
                             stats["found"] += 1
                             source_stats["found"] += 1
                             if not scraped.posted_at and not config.get(
@@ -267,7 +270,7 @@ async def _execute(run_id: int) -> None:
                         JobProfile, JobProfile.job_id == Job.id
                     ).filter(
                         JobProfile.profile_id == profile_id,
-                        JobProfile.match_score.is_(None),
+                        or_(JobProfile.match_score.is_(None), JobProfile.score_stale.is_(True)),
                         Job.status != JobStatus.ARCHIVED,
                         func.length(Job.description) >= 100,
                     ).order_by(Job.last_seen_at.desc()).limit(screen_limit).all()
@@ -281,11 +284,13 @@ async def _execute(run_id: int) -> None:
                             job = session.get(Job, job_id)
                             if job:
                                 job.match_score, job.match_explanation = result.score, result.explanation
-                                job.status = JobStatus.SHORTLISTED if result.score >= .3 else JobStatus.ANALYZED
+                                set_scored_status(job, JobStatus.SHORTLISTED if result.score >= .3 else JobStatus.ANALYZED)
                                 link = session.get(JobProfile, (job_id, profile_id))
                                 if link:
                                     link.match_score, link.match_explanation = result.score, result.explanation
                                     link.screened_at = datetime.utcnow()
+                                    from employers.ingestion import mark_scores_fresh
+                                    mark_scores_fresh(session, job_id, profile_id)
                         return True
                     except Exception:
                         return False
@@ -413,7 +418,8 @@ async def _enrich_or_check(job_id: int, availability: bool) -> bool:
         if result:
             from job_lifecycle import mark_available
             mark_available(job)
-            if len(result[0]) > 100:
+            from employers.ingestion import board_may_enrich
+            if len(result[0]) > 100 and board_may_enrich(session, job.id):
                 job.description = result[0]
             if result[1]:
                 job.url = result[1]
@@ -446,6 +452,9 @@ def start_scheduler() -> None:
     _scheduler = AsyncIOScheduler(timezone="Europe/Zurich")
     _scheduler.start()
     reschedule()
+    from employers.tasks import dispatch
+    _scheduler.add_job(dispatch, "interval", seconds=60, id="employer-sources",
+                       max_instances=1, coalesce=True)
 
 
 def reschedule() -> None:
@@ -458,6 +467,8 @@ def reschedule() -> None:
 
 
 async def stop_scheduler() -> None:
+    from employers.tasks import stop
+    await stop()
     global _scheduler
     if _scheduler and _scheduler.running:
         _scheduler.shutdown(wait=False)

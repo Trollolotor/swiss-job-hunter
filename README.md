@@ -388,3 +388,9 @@ If you use this code to provide a hosted service, you must release your modifica
 
 [![Star History Chart](https://api.star-history.com/svg?repos=Donvink/swiss-job-hunter&type=Date)](https://star-history.com/#Donvink/swiss-job-hunter&Date)
 </div>
+
+## Employer career sources (optional)
+
+Settings → Employer Sources adds employer discovery, direct portal collection, source provenance,
+and validated connector generation/repair. The mode starts disabled, with paid onboarding blocked
+until a separate budget and model prices are configured. See [setup, migrations, isolation, and pilot instructions](docs/employer-sources.md).

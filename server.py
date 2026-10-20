@@ -23,6 +23,7 @@ from pydantic import BaseModel
 from sqlalchemy import func
 
 from config.settings import settings
+from job_lifecycle import set_scored_status
 
 
 @asynccontextmanager
@@ -51,6 +52,8 @@ app.add_middleware(
 
 from api_ext import router as settings_router
 app.include_router(settings_router)
+from employers.api import router as employers_router
+app.include_router(employers_router)
 
 
 @app.get("/directions")
@@ -89,6 +92,7 @@ def get_jobs_query(
     profile_id: Optional[int] = None, published_within: Optional[int] = None,
     sort: str = "priority", include_unknown_dates: bool = True,
 ):
+    from employers.ingestion import job_source_fields
     from analyzer.freshness import freshness, priority, utc_naive
     from config.runtime import get_priority_config
     from db.session import get_session
@@ -123,6 +127,10 @@ def get_jobs_query(
         company_rows = session.query(CompanyInfo).all()
         companies = {row.normalized_name or normalize_company_name(row.name): company_dict(row)
                      for row in company_rows}
+        from db.models import JobSource
+        source_rows = {}
+        for row in session.query(JobSource).filter(JobSource.job_id.in_([j.id for j in jobs])).all():
+            source_rows.setdefault(row.job_id, []).append(row)
         records = []
         for j in jobs:
             fresh_score, age_label, age_days = freshness(j.posted_at, config)
@@ -135,6 +143,7 @@ def get_jobs_query(
             match_score = profile_match.match_score if profile_match and profile_match.match_score is not None else j.match_score
             match_explanation = profile_match.match_explanation if profile_match and profile_match.match_explanation else j.match_explanation
             records.append({
+                **job_source_fields(session, j.id, source_rows.get(j.id, [])),
                 "id": j.id, "title": j.title, "company": j.company,
                 "location": j.location, "description": j.description, "url": j.url,
                 "source": j.source, "source_job_id": j.source_job_id,
@@ -356,6 +365,8 @@ async def run_search(req: SearchRequest):
                         kwargs["experience_level"] = req.linkedin_experience_level
                     async with scraper_cls(**kwargs) as scraper:
                         async for scraped in scraper.scrape(kw, req.location, req.pages):
+                            from employers.discovery import observe_board_result
+                            observe_board_result(scraped)
                             found_count += 1
                             if req.max_age_days is not None:
                                 if not scraped.posted_at and not req.include_unknown_dates:
@@ -486,7 +497,9 @@ async def run_enrich(req: EnrichRequest):
                             with get_session() as session:
                                 job = session.get(Job, job_id)
                                 if job:
-                                    job.description = desc
+                                    from employers.ingestion import board_may_enrich
+                                    if board_may_enrich(session, job.id):
+                                        job.description = desc
                                     if canonical_url:
                                         job.url = canonical_url
                                     from job_lifecycle import mark_available
@@ -548,9 +561,9 @@ async def run_enrich(req: EnrichRequest):
                         if job:
                             job.match_score = result.score
                             if result.score < 0.1:
-                                job.status = JobStatus.ARCHIVED
+                                set_scored_status(job, JobStatus.ARCHIVED)
                             elif result.score >= 0.6:
-                                job.status = JobStatus.SHORTLISTED
+                                set_scored_status(job, JobStatus.SHORTLISTED)
                     scored += 1
                     yield f"  🧠 job #{job_id} — {round(result.score * 100)}%"
                 except Exception as e:
@@ -596,7 +609,10 @@ async def run_analyze(req: AnalyzeRequest):
             if req.direction:
                 query = query.filter(or_(Job.direction == req.direction, Job.profiles.any(SearchProfile.slug == req.direction)))
             if req.skip_scored:
-                query = query.filter(Job.match_score.is_(None))
+                stale_ids = session.query(JobProfile.job_id).filter(JobProfile.score_stale.is_(True))
+                if scoring_profile_id:
+                    stale_ids = stale_ids.filter(JobProfile.profile_id == scoring_profile_id)
+                query = query.filter(or_(Job.match_score.is_(None), Job.id.in_(stale_ids)))
             lim = req.limit if req.skip_scored else 9999
             jobs = query.order_by(Job.scraped_at.desc()).limit(lim).all()
             job_data = [(j.id, j.title, j.description) for j in jobs]
@@ -632,11 +648,13 @@ async def run_analyze(req: AnalyzeRequest):
                                 if job:
                                     job.match_score = kw_result.score
                                     job.match_explanation = f"[keyword pre-filter] {kw_result.explanation}"
-                                    job.status = JobStatus.ARCHIVED
+                                    set_scored_status(job, JobStatus.ARCHIVED)
                                     link = session.get(JobProfile, (job_id, scoring_profile_id)) if scoring_profile_id else None
                                     if link:
                                         link.match_score, link.match_explanation = job.match_score, job.match_explanation
                                         link.screened_at = datetime.utcnow()
+                                        from employers.ingestion import mark_scores_fresh
+                                        mark_scores_fresh(session, job_id, scoring_profile_id)
                             skipped += 1
                             await queue.put(f"– #{job_id} {kw_result.score:.0%} (skipped) — {title[:45]}")
                         else:
@@ -650,13 +668,15 @@ async def run_analyze(req: AnalyzeRequest):
                                     if link:
                                         link.match_score, link.match_explanation = result.score, result.explanation
                                         link.screened_at = datetime.utcnow()
+                                        from employers.ingestion import mark_scores_fresh
+                                        mark_scores_fresh(session, job_id, scoring_profile_id)
                                     if result.score >= threshold:
-                                        job.status = JobStatus.SHORTLISTED
+                                        set_scored_status(job, JobStatus.SHORTLISTED)
                                         shortlisted += 1
                                     elif result.score < req.archive_below:
-                                        job.status = JobStatus.ARCHIVED
+                                        set_scored_status(job, JobStatus.ARCHIVED)
                                     else:
-                                        job.status = JobStatus.ANALYZED
+                                        set_scored_status(job, JobStatus.ANALYZED)
                             score_pct = f"{result.score:.0%}"
                             icon = "⭐" if result.score >= req.min_score else ("✗" if result.score < req.archive_below else "·")
                             await queue.put(f"{icon} #{job_id} {score_pct} — {title[:45]}")
@@ -688,7 +708,9 @@ async def run_analyze(req: AnalyzeRequest):
                             if link:
                                 link.match_score, link.match_explanation = result.score, result.explanation
                                 link.screened_at = datetime.utcnow()
-                            job.status = JobStatus.SHORTLISTED if result.score >= threshold else JobStatus.ANALYZED
+                                from employers.ingestion import mark_scores_fresh
+                                mark_scores_fresh(session, job_id, scoring_profile_id)
+                            set_scored_status(job, JobStatus.SHORTLISTED if result.score >= threshold else JobStatus.ANALYZED)
                             if result.score >= threshold:
                                 shortlisted += 1
                     score_pct = f"{result.score:.0%}"
@@ -722,6 +744,11 @@ async def run_purge_archived(req: PurgeRequest):
                     Job.status.in_(_purgeable),
                     Job.match_score.isnot(None),
                     Job.match_score < req.max_score,
+                    ~Job.application.has(),
+                    ~Job.events.any(),
+                    Job.user_stars.is_(None),
+                    Job.viewed_at.is_(None),
+                    Job.applied_at.is_(None),
                 )
                 .order_by(Job.match_score.asc())
                 .all()
@@ -1102,7 +1129,8 @@ def get_tracker():
     sorted by last activity, for the tracker board.
     """
     from db.session import get_session
-    from db.models import Job, JobStatus, Application
+    from db.models import Job, JobStatus, Application, JobSource
+    from employers.ingestion import job_source_fields
     active_statuses = [
         JobStatus.VIEWED, JobStatus.CONSIDERING, JobStatus.APPLIED,
         JobStatus.INTERVIEWING, JobStatus.OFFER,
@@ -1115,10 +1143,14 @@ def get_tracker():
             .order_by(Job.updated_at.desc())
             .all()
         )
+        source_rows = {}
+        for row in session.query(JobSource).filter(JobSource.job_id.in_([j.id for j in jobs])).all():
+            source_rows.setdefault(row.job_id, []).append(row)
         result = []
         for j in jobs:
             app = session.query(Application).filter(Application.job_id == j.id).first()
             result.append({
+                **job_source_fields(session, j.id, source_rows.get(j.id, [])),
                 "id": j.id,
                 "title": j.title,
                 "company": j.company,

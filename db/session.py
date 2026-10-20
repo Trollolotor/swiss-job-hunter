@@ -106,6 +106,7 @@ def _init_db_once() -> None:
     with engine.begin() as conn:
         for name, sql_type in {
             "match_score": "FLOAT", "match_explanation": "TEXT", "screened_at": "DATETIME",
+            "score_stale": "BOOLEAN DEFAULT 0",
         }.items():
             if name not in job_profile_columns:
                 conn.execute(text(f"ALTER TABLE job_profiles ADD COLUMN {name} {sql_type}"))

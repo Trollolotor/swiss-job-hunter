@@ -110,6 +110,8 @@ async def call_task_llm(
     use_cache: bool = True,
     temperature: float = 0.2,
 ) -> tuple[str, str]:
+    if operation in {"employer_resolution", "connector_investigation", "connector_generation", "connector_repair"}:
+        raise ValueError("Employer operations must run through the budgeted employer workflow")
     if not settings.openrouter_api_key:
         raise RuntimeError("OPENROUTER_API_KEY is required for task-based LLM routing")
 

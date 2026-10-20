@@ -50,12 +50,14 @@ async def _search(
 
     init_db()
 
+    from employers.config import enabled
+    employer_mode = enabled()
     active_sources = sources or ALL_SOURCES
     console.print(f"\n[bold]Searching:[/bold] [cyan]{keyword}[/cyan] in [yellow]{location}[/yellow]")
     console.print(f"Sources: {', '.join(active_sources)}\n")
 
     sem_dedup: Optional[SemanticDeduplicator] = None
-    if semantic:
+    if semantic and not employer_mode:
         try:
             sem_dedup = SemanticDeduplicator()
             n = sem_dedup.load_from_db()
@@ -80,12 +82,14 @@ async def _search(
 
         async with scraper_cls() as scraper:
             async for scraped in scraper.scrape(keyword, location, max_pages):
+                from employers.discovery import observe_board_result
+                observe_board_result(scraped)
                 # Stage 1: exact dedup
-                if is_exact_duplicate(scraped.title, scraped.company, scraped.location):
+                if not employer_mode and is_exact_duplicate(scraped.title, scraped.company, scraped.location):
                     continue
 
                 # Stage 2: semantic dedup
-                if sem_dedup:
+                if sem_dedup and not employer_mode:
                     text = f"{scraped.title} {scraped.company} {scraped.location}"
                     is_dup, sim = sem_dedup.is_duplicate(text)
                     if is_dup:
