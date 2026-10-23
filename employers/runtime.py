@@ -97,7 +97,9 @@ async def _run_isolated(kind, payload, context, image_digest=None, browser_image
                     from employers.validation import posting_errors
 
                     posting = CollectedPosting.model_validate(message["posting"])
-                    errors = posting_errors(posting, context.observations)
+                    errors = posting_errors(
+                        posting, context.observations, getattr(context, "manifest", None)
+                    )
                     if len(context.staged) >= 10000 or errors:
                         raise ValueError(
                             "Posting sighting rejected: "

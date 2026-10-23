@@ -1,0 +1,29 @@
+{
+  "portal": "https://apply.workable.com/acme",
+  "catalogue": {
+    "name": "Acme",
+    "jobs": [
+      {
+        "shortcode": "ABC123",
+        "title": "Platform Engineer",
+        "url": "https://apply.workable.com/acme/j/ABC123/",
+        "application_url": "https://apply.workable.com/acme/j/ABC123/apply/",
+        "description": "<p>Build Python services.</p>",
+        "requirements": "<p>Python and SQL</p>",
+        "benefits": "<p>Flexible hours</p>",
+        "locations": [
+          {
+            "city": "Bern",
+            "country": "CH"
+          },
+          {
+            "city": "Zürich",
+            "country": "Switzerland"
+          }
+        ],
+        "published_on": "2026-10-01",
+        "telecommuting": true
+      }
+    ]
+  }
+}

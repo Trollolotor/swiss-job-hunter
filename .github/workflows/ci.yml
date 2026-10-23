@@ -54,6 +54,16 @@ jobs:
         run: pytest tests/ -v --tb=short --ignore=tests/test_scrapers.py
         # Skip scraper tests in CI (require network)
 
+      - name: Check ATS library lint
+        run: ruff check ats_core ats_vendors employers/ats_validation.py employers/ready.py tests/test_ats_libraries.py tests/test_ats_product.py tools/check_ats_libraries.py
+
+      - name: Check network-disabled ATS runtime
+        if: matrix.python-version == '3.11'
+        run: |
+          docker build --target python -t sjh-ats-check -f connector_runtime/Dockerfile .
+          image_id=$(docker image inspect sjh-ats-check --format '{{.Id}}')
+          python tools/check_ats_libraries.py "$image_id"
+
       - name: Test DB init
         run: |
           python -c "

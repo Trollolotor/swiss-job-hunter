@@ -415,3 +415,7 @@ If you use this code to provide a hosted service, you must release your modifica
 Settings → Employer Sources adds employer discovery, direct portal collection, source provenance,
 and validated connector generation/repair. The mode starts disabled, with paid onboarding blocked
 until a separate budget and model prices are configured. See [setup, migrations, isolation, and pilot instructions](docs/employer-sources.md).
+
+Recognized Workable, SuccessFactors, Workday, Greenhouse, Lever, Ashby, Recruitee and Teamtailor
+portals use [separate internal ATS libraries](docs/ats-libraries.md) before paid connector generation.
+They retain the existing employer-crawling, evidence, validation and LLM repair rules.

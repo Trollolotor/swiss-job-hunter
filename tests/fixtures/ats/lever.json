@@ -1,0 +1,29 @@
+{
+  "portal": "https://jobs.lever.co/acme",
+  "catalogue": [
+    {
+      "id": "lever-123",
+      "text": "Platform Engineer",
+      "hostedUrl": "https://jobs.lever.co/acme/lever-123",
+      "applyUrl": "https://jobs.lever.co/acme/lever-123/apply",
+      "description": "<p>Build Python services.</p>",
+      "descriptionPlain": "Build Python services.",
+      "lists": [
+        {
+          "text": "Requirements",
+          "content": "<ul><li>Python and SQL</li></ul>"
+        }
+      ],
+      "categories": {
+        "location": "Bern, Switzerland",
+        "allLocations": [
+          "Bern, Switzerland",
+          "Zürich, Schweiz"
+        ],
+        "commitment": "Full-time"
+      },
+      "workplaceType": "hybrid",
+      "createdAt": 1780000000000
+    }
+  ]
+}

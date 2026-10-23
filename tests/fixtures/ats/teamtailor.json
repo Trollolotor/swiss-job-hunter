@@ -1,0 +1,4 @@
+{
+  "portal": "https://acme.teamtailor.com",
+  "catalogue": "<rss version=\"2.0\" xmlns:tt=\"https://teamtailor.com/locations\"><channel><title>Acme careers</title><item><title>Platform Engineer</title><link>https://acme.teamtailor.com/jobs/123-platform-engineer</link><guid>teamtailor-123</guid><description><![CDATA[<h2>Responsibilities</h2><p>Build Python services.</p><h2>Requirements</h2><ul><li>Python and SQL</li></ul>]]></description><pubDate>Thu, 01 Oct 2026 10:00:00 GMT</pubDate><remoteStatus>hybrid</remoteStatus><tt:locations><tt:location><tt:city>Bern</tt:city><tt:country>Switzerland</tt:country></tt:location><tt:location><tt:city>Zürich</tt:city><tt:country>Schweiz</tt:country></tt:location></tt:locations></item></channel></rss>"
+}
