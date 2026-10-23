@@ -3,6 +3,7 @@ import SettingsView from "./SettingsView";
 import TagEditor from "./TagEditor";
 import ReviewQueue from "./ReviewQueue";
 import VacancyEvidence from "./VacancyEvidence";
+import DetailPane from "./DetailPane";
 import {vacancyQuery} from "./vacancyQuery";
 
 const API = import.meta.env.VITE_API_BASE_URL ?? "http://localhost:8765";
@@ -329,21 +330,60 @@ function Timeline({ jobId, onRefresh }) {
 
 // ── Tracker board ─────────────────────────────────────────────────────────────
 
-function TrackerBoard({ onSelectJob }) {
+export function TrackerBoard({ onSelectJob, onChanged, onChangeFailed }) {
   const [items, setItems] = useState([]);
   const [expanded, setExpanded] = useState(null);
+  const [error, setError] = useState("");
+  const [dragId, setDragId] = useState(null);
+  const [dropCol, setDropCol] = useState(null);
+  const [pending, setPending] = useState(null);
+  const pendingRef = useRef(false);
+  const loadVersion = useRef(0);
 
   const load = useCallback(async () => {
+    if (pendingRef.current) return;
+    const version = ++loadVersion.current;
     const r = await fetch(`${API}/tracker`);
-    if (r.ok) setItems(await r.json());
+    if (!r.ok) throw new Error("Could not refresh tracker");
+    const data = await r.json();
+    if (version === loadVersion.current) { setItems(data); setError(""); }
   }, []);
 
-  useEffect(() => { load(); const t = setInterval(load, 15000); return ()=>clearInterval(t); }, [load]);
+  useEffect(() => {
+    const refresh = () => load().catch(e=>setError(e.message));
+    refresh(); const timer = setInterval(refresh, 15000);
+    return () => { clearInterval(timer); ++loadVersion.current; };
+  }, [load]);
 
-  const cols = ["viewed","considering","applied","interviewing","offer","rejected"];
+  const cols = ["considering","applied","interviewing","offer","rejected","archived"];
   const byStatus = Object.fromEntries(cols.map(c => [c, items.filter(j=>j.status===c)]));
 
   const fmt = iso => iso ? new Date(iso).toLocaleDateString("de-CH",{day:"2-digit",month:"2-digit"}) : "—";
+
+  const moveTo = async (jobId, status) => {
+    const job = items.find(item=>item.id===jobId);
+    if (!job || job.status===status || pendingRef.current || !cols.includes(status)) return;
+    pendingRef.current = true; ++loadVersion.current;
+    setPending(jobId); setError("");
+    setItems(previous=>previous.map(item=>item.id===jobId?{...item,status}:item));
+    try {
+      const response = await fetch(`${API}/jobs/${jobId}/status`, {
+        method:"PATCH",headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({status,reason:"Moved on application tracker"}),
+      });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    } catch (cause) {
+      setItems(previous=>previous.map(item=>item.id===jobId?job:item));
+      setError(`Could not move ${job.title} to ${status}; card restored. ${cause.message}`);
+      onChangeFailed?.(jobId,status);
+      return;
+    } finally {
+      pendingRef.current = false; setPending(null);
+    }
+    onChanged?.(jobId,status);
+    // A failed refresh must not undo a status change the server already saved.
+    await load().catch(()=>setError("Status saved. Could not refresh tracker; use refresh to retry."));
+  };
 
   return (
     <div style={{flex:1,overflow:"hidden",display:"flex",flexDirection:"column"}}>
@@ -355,10 +395,12 @@ function TrackerBoard({ onSelectJob }) {
           PROGRESS TRACKER
         </span>
         <span style={{fontSize:10,color:"#6b8c7a"}}>·</span>
-        <span style={{fontSize:10,color:"#6b8c7a"}}>{items.length} active</span>
+        <span style={{fontSize:10,color:"#6b8c7a"}}>{items.filter(j=>!["rejected","archived"].includes(j.status)).length} active · {items.length} total</span>
+        <span style={{fontSize:10,color:"#6b8c7a"}}>Drag cards or use Move to</span>
         <div style={{flex:1}}/>
-        <button onClick={load} style={{background:"none",border:"none",color:"#5a7a68",cursor:"pointer",fontSize:12}}>↺</button>
+        <button aria-label="Refresh tracker" disabled={pending!==null} onClick={()=>load().catch(e=>setError(e.message))} style={{background:"none",border:"none",color:"#5a7a68",cursor:"pointer",fontSize:12}}>↺</button>
       </div>
+      {error && <div role="alert" style={{padding:"8px 20px",color:"#b54738"}}>{error}</div>}
 
       <div style={{flex:1,overflow:"hidden",display:"flex"}}>
         {/* Kanban columns */}
@@ -367,9 +409,16 @@ function TrackerBoard({ onSelectJob }) {
             const m = STATUS_META[col];
             const colJobs = byStatus[col] || [];
             return (
-              <div key={col} style={{
+              <div key={col} role="region" aria-label={`Tracker ${col}`}
+                onDragOver={event=>{event.preventDefault(); if(!pendingRef.current)setDropCol(col);}}
+                onDragLeave={()=>setDropCol(null)}
+                onDrop={event=>{
+                  event.preventDefault();setDropCol(null);setDragId(null);
+                  const id=Number(event.dataTransfer.getData("text/plain"));
+                  if(Number.isInteger(id))moveTo(id,col);
+                }} style={{
                 minWidth:220,flex:1,marginRight:12,
-                background:"#e8ede4",border:`1px solid ${m.color}20`,
+                background:dropCol===col?`${m.color}18`:"#e8ede4",border:`1px solid ${m.color}20`,
                 borderTop:`2px solid ${m.color}`,borderRadius:6,
                 display:"flex",flexDirection:"column",maxHeight:"100%",
               }}>
@@ -387,12 +436,19 @@ function TrackerBoard({ onSelectJob }) {
                     ? <div style={{color:"#d4dece",fontSize:10,textAlign:"center",padding:"20px 0"}}>empty</div>
                     : colJobs.map(j=>(
                       <div key={j.id}
+                        draggable={pending===null}
+                        onDragStart={event=>{
+                          if(pendingRef.current){event.preventDefault();return;}
+                          event.dataTransfer.setData("text/plain",String(j.id));
+                          event.dataTransfer.effectAllowed="move";setDragId(j.id);
+                        }}
+                        onDragEnd={()=>{setDragId(null);setDropCol(null);}}
                         onClick={()=>{ setExpanded(expanded===j.id?null:j.id); onSelectJob?.(j); }}
                         style={{
                           background: expanded===j.id?"#d4dece":"#e2e8dc",
                           border:`1px solid ${expanded===j.id?m.color+"40":"#d4dece"}`,
                           borderRadius:5,padding:"10px 11px",marginBottom:8,
-                          cursor:"pointer",transition:"all 0.15s",
+                          cursor:"grab",transition:"all 0.15s",opacity:dragId===j.id ? 0.5 : 1,
                         }}
                         onMouseEnter={e=>e.currentTarget.style.borderColor=m.color+"40"}
                         onMouseLeave={e=>e.currentTarget.style.borderColor=expanded===j.id?m.color+"40":"#d4dece"}
@@ -414,6 +470,14 @@ function TrackerBoard({ onSelectJob }) {
                           </span>
                         </div>
 
+                        <label style={{display:"block",fontSize:9,marginTop:8}} onClick={event=>event.stopPropagation()}>
+                          Move to {" "}
+                          <select aria-label={`Move ${j.title}`} value={j.status} disabled={pending!==null}
+                            onChange={event=>moveTo(j.id,event.target.value)} onDragStart={event=>event.preventDefault()}>
+                            {cols.map(status=><option key={status} value={status}>{status}</option>)}
+                          </select>
+                        </label>
+
                         {expanded===j.id && (
                           <div style={{marginTop:10,borderTop:"1px solid #d4dece",paddingTop:10}}>
                             {j.apply_method && (
@@ -425,7 +489,7 @@ function TrackerBoard({ onSelectJob }) {
                             {j.notes && (
                               <div style={{fontSize:9,color:"#4a7a60",marginBottom:8,lineHeight:1.5}}>{j.notes}</div>
                             )}
-                            <Timeline jobId={j.id} onRefresh={load}/>
+                            <Timeline jobId={j.id} onRefresh={()=>load().catch(e=>setError(e.message))}/>
                             <div style={{marginTop:10}}>
                               <a href={j.application_url||j.url} target="_blank" rel="noreferrer" style={{
                                 fontSize:9,color:"#2e7d52",textDecoration:"none",
@@ -459,7 +523,8 @@ export default function App() {
   const [searchKwInput, setSearchKwInput] = useState("");
   const [searchLoc, setSearchLoc] = useState("");
   const [searchSrc, setSearchSrc] = useState(["jobs.ch"]);
-  const [filterStatus, setFilterStatus] = useState("all");
+  const [filterStatus, setFilterStatus] = useState("active");
+  const [filterSource, setFilterSource] = useState("all");
   const [filterText, setFilterText] = useState("");
   const [filterMinStars, setFilterMinStars] = useState(0);
   const [coverLetter, setCoverLetter] = useState("");
@@ -496,22 +561,22 @@ export default function App() {
   const fetchJobs = useCallback(async () => {
     try {
       const profileId=profiles.find(p=>p.slug===direction)?.id||"";
-      const params=vacancyQuery({profileId,direction,status:filterStatus,q:filterText,minStars:filterMinStars,sort:sortMode,publishedWithin,directOnly,reviewQueue:mainTab==="review",minScore:threshold/100});
+      const params=vacancyQuery({profileId,direction,status:filterStatus,source:filterSource,q:filterText,minStars:filterMinStars,sort:sortMode,publishedWithin,directOnly,reviewQueue:mainTab==="review",minScore:threshold/100});
       const r = await fetch(`${API}/jobs?${params}`);
       if (r.ok) { const data=await r.json();setJobs(data);setSelected(current=>current?data.find(j=>j.id===current.id)||current:current);setBackendOk(true); }
     } catch {
       if (backendOk) addLog("✗ Backend offline — run: python server.py");
       setBackendOk(false);
     }
-  }, [filterStatus, filterText, direction, profiles, filterMinStars, sortMode, publishedWithin, directOnly, mainTab, threshold, addLog, backendOk]);
+  }, [filterStatus, filterSource, filterText, direction, profiles, filterMinStars, sortMode, publishedWithin, directOnly, mainTab, threshold, addLog, backendOk]);
 
   const fetchStats = useCallback(async () => {
     try {
-      const params=vacancyQuery({profileId:profiles.find(p=>p.slug===direction)?.id,direction,status:filterStatus,q:filterText,minStars:filterMinStars,publishedWithin,directOnly,reviewQueue:mainTab==="review",minScore:threshold/100});
+      const params=vacancyQuery({profileId:profiles.find(p=>p.slug===direction)?.id,direction,status:filterStatus,source:filterSource,q:filterText,minStars:filterMinStars,publishedWithin,directOnly,reviewQueue:mainTab==="review",minScore:threshold/100});
       params.set("threshold",String(threshold/100));
       const r=await fetch(`${API}/stats?${params}`); if(r.ok)setStats(await r.json());
     }catch{}
-  },[threshold,profiles,direction,filterStatus,filterText,directOnly,mainTab,filterMinStars,publishedWithin]);
+  },[threshold,profiles,direction,filterStatus,filterSource,filterText,directOnly,mainTab,filterMinStars,publishedWithin]);
 
   useEffect(() => { fetchJobs(); fetchStats(); }, [fetchJobs, fetchStats]);
 
@@ -755,7 +820,7 @@ export default function App() {
   };
 
   const visible = jobs.filter(j=>
-    (filterStatus==="all"||j.status===filterStatus) &&
+    (filterStatus==="all"||(filterStatus==="active"?j.status!=="archived":j.status===filterStatus)) &&
     (threshold===0 || (j.match_score!=null && j.match_score*100 >= threshold))
   );
 
@@ -837,7 +902,12 @@ export default function App() {
                 onSelect={j=>{setSelected(j);setMainTab("board");}}
                 onPrepare={j=>{setSelected(j);setMainTab("board");tailorCv(j);}}/>
             : mainTab==="tracker"
-            ? <TrackerBoard onSelectJob={j=>{setSelected(j);setMainTab("board");}}/>
+            ? <TrackerBoard onSelectJob={j=>{setSelected(j);setMainTab("board");}}
+                onChanged={(jobId,status)=>{
+                  setSelected(current=>current?.id===jobId?{...current,status}:current);
+                  fetchJobs();fetchStats();addLog(`✓ #${jobId} → ${status}`);
+                }}
+                onChangeFailed={(jobId,status)=>addLog(`✗ #${jobId} → ${status} failed; card restored`)}/>
             : <>
               {/* LEFT PANEL */}
               <div style={{width:300,borderRight:"1px solid #d4dece",display:"flex",
@@ -1002,8 +1072,8 @@ export default function App() {
                   <div style={{fontSize:9,color:"#5a7a68",letterSpacing:"0.12em",fontWeight:700,marginBottom:4}}>FILTER</div>
                   <label style={{fontSize:10}}><input type="checkbox" checked={directOnly} onChange={e=>setDirectOnly(e.target.checked)}/> Not yet observed on our monitored boards</label>
                   <div style={{display:"flex",flexWrap:"wrap",gap:3,marginBottom:5}}>
-                    {["all","new","shortlisted","viewed","considering","applied","interviewing","offer","rejected"].map(s=>(
-                      <button key={s} onClick={()=>setFilterStatus(s)} style={{
+                    {["active","all","new","analyzed","shortlisted","viewed","considering","applied","interviewing","offer","rejected","archived"].map(s=>(
+                      <button key={s} aria-label={`Filter status ${s}`} aria-pressed={filterStatus===s} onClick={()=>setFilterStatus(s)} style={{
                         fontSize:8,padding:"2px 7px",borderRadius:3,border:"1px solid",
                         borderColor:filterStatus===s?(STATUS_META[s]?.color||"#2e7d52")+"40":"#d4dece",
                         background:filterStatus===s?(STATUS_META[s]?.color||"#2e7d52")+"15":"transparent",
@@ -1012,6 +1082,11 @@ export default function App() {
                       }}>{s.toUpperCase()}</button>
                     ))}
                   </div>
+                  <select aria-label="Filter by source" value={filterSource} onChange={e=>setFilterSource(e.target.value)} style={{...inp,marginBottom:5}}>
+                    <option value="all">All sources</option>
+                    <option value="employer">Employer sites</option>
+                    {SOURCES.map(source=><option key={source} value={source}>{source}</option>)}
+                  </select>
                   <div style={{display:"flex",gap:5,alignItems:"center",marginBottom:4}}>
                     <input value={filterText} onChange={e=>setFilterText(e.target.value)}
                       placeholder="search title / company..." style={{...inp,fontSize:10,flex:1}}/>
@@ -1131,8 +1206,7 @@ export default function App() {
               </div>
 
               {/* RIGHT PANEL */}
-              <div style={{width:400,borderLeft:"1px solid #d4dece",display:"flex",
-                flexDirection:"column",background:"#f0f3ed",flexShrink:0}}>
+              <DetailPane>
                 <div style={{display:"flex",borderBottom:"1px solid #d4dece",flexShrink:0}}>
                   <RTab id="detail" label="DETAIL"/>
                   <RTab id="company" label="COMPANY"/>
@@ -1140,6 +1214,24 @@ export default function App() {
                   <RTab id="apply" label="APPLY"/>
                   <RTab id="tailor" label="TAILOR"/>
                 </div>
+
+                {selected && <div role="group" aria-label="Update vacancy status" style={{padding:"10px 14px",borderBottom:"1px solid #d4dece",flexShrink:0}}>
+                  <div style={{fontSize:9,color:"#5a7a68",fontWeight:700,marginBottom:7}}>UPDATE STATUS</div>
+                  <div style={{display:"flex",flexWrap:"wrap",gap:5}}>
+                    {["viewed","considering","shortlisted","applied","interviewing","offer","rejected","archived"].map(status=>(
+                      <button key={status} aria-pressed={selected.status===status} aria-label={`Set status ${status}`}
+                        onClick={()=>{
+                          if(status==="applied") setApplyModal(true);
+                          else updateStatus(selected.id,status).catch(error=>addLog(`✗ ${error.message}`));
+                        }} style={{fontSize:8,padding:"4px 8px",borderRadius:3,
+                          border:`1px solid ${STATUS_META[status].color}30`,
+                          background:selected.status===status?`${STATUS_META[status].color}20`:"transparent",
+                          color:STATUS_META[status].color,cursor:"pointer",fontFamily:"monospace",fontWeight:700}}>
+                        {status.toUpperCase()}
+                      </button>
+                    ))}
+                  </div>
+                </div>}
 
                 {/* DETAIL TAB */}
                 {rightTab==="detail" && (
@@ -1223,23 +1315,6 @@ export default function App() {
                             disabled={!selected?.description} label="TAILOR CV FOR THIS JD" icon="📝" color="#f59e0b"/>
                         </div>
 
-                        <div>
-                          <div style={{fontSize:9,color:"#5a7a68",letterSpacing:"0.1em",fontWeight:700,marginBottom:7}}>UPDATE STATUS</div>
-                          <div style={{display:"flex",flexWrap:"wrap",gap:5,marginBottom:10}}>
-                            {["viewed","considering","shortlisted","applied","interviewing","offer","rejected","archived"].map(s=>(
-                              <button key={s} aria-pressed={selected.status===s} aria-label={`Set status ${s}`} onClick={()=>{
-                                if(s==="applied") setApplyModal(true);
-                                else updateStatus(selected.id,s);
-                              }} style={{
-                                fontSize:8,padding:"4px 8px",borderRadius:3,
-                                border:`1px solid ${STATUS_META[s]?.color||"#5a7a68"}30`,
-                                background:selected.status===s?`${STATUS_META[s]?.color}20`:"transparent",
-                                color:STATUS_META[s]?.color||"#5a7a68",
-                                cursor:"pointer",fontFamily:"monospace",fontWeight:700,letterSpacing:"0.05em",
-                              }}>{s.toUpperCase()}</button>
-                            ))}
-                          </div>
-                        </div>
                       </>
                     }
                   </div>
@@ -1434,7 +1509,7 @@ export default function App() {
                     }
                   </div>
                 )}
-              </div>
+              </DetailPane>
             </>
           }
         </div>

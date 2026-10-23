@@ -92,12 +92,13 @@ def get_jobs_query(
     profile_id: Optional[int] = None, published_within: Optional[int] = None,
     sort: str = "priority", include_unknown_dates: bool = True,
     direct_only: bool = False, review_queue: bool = False, min_score: float = 0.0,
+    source: str = "all",
 ):
     from employers.ingestion import job_source_fields
     from analyzer.freshness import freshness, priority, utc_naive
     from config.runtime import get_priority_config
     from db.session import get_session
-    from db.models import Job, JobStatus, SearchProfile, CompanyInfo, JobProfile
+    from db.models import Job, JobStatus, SearchProfile, CompanyInfo, JobProfile, JobSource
     from company_service import company_dict, normalize_company_name
     from sqlalchemy import or_
     from sqlalchemy.orm import selectinload
@@ -107,8 +108,22 @@ def get_jobs_query(
     with get_session() as session:
         query = session.query(Job).options(selectinload(Job.profiles).load_only(
             SearchProfile.id, SearchProfile.slug, SearchProfile.name))
-        if status != "all":
+        if status == "active":
+            query = query.filter(Job.status != JobStatus.ARCHIVED)
+        elif status != "all":
             query = query.filter(Job.status == status)
+        if source != "all":
+            membership = session.query(JobSource.id).filter(JobSource.job_id == Job.id)
+            if source == "employer":
+                query = query.filter(membership.filter(JobSource.source_id.isnot(None)).exists())
+            else:
+                # A canonical job may have sightings on several boards and an
+                # employer site. Filter membership without changing its content
+                # authority, preferred application link, or primary source.
+                query = query.filter(or_(
+                    Job.source == source,
+                    membership.filter(JobSource.namespace.in_([source, f"board:{source}"])).exists(),
+                ))
         if profile_id:
             query = query.filter(Job.profiles.any(SearchProfile.id == profile_id))
         elif direction != "all":
@@ -136,7 +151,6 @@ def get_jobs_query(
         company_rows = session.query(CompanyInfo).all()
         companies = {row.normalized_name or normalize_company_name(row.name): company_dict(row)
                      for row in company_rows}
-        from db.models import JobSource
         source_rows = {}
         for row in session.query(JobSource).filter(JobSource.job_id.in_([j.id for j in jobs])).all():
             source_rows.setdefault(row.job_id, []).append(row)
@@ -212,6 +226,7 @@ def list_jobs(
     profile_id: Optional[int] = None, published_within: str = "",
     sort: str = "priority", include_unknown_dates: bool = True,
     direct_only: bool = False, review_queue: bool = False, min_score: float = 0.0,
+    source: str = "all",
 ):
     from db.session import init_db, get_session
     from analyzer.matching import resolve_profiles, ProfileSelectionError
@@ -227,19 +242,19 @@ def list_jobs(
     except ValueError as exc:
         raise HTTPException(422, "published_within must be a number of days") from exc
     return get_jobs_query(status, q, direction, min_stars, profile_id, days, sort,
-                          include_unknown_dates, direct_only, review_queue, min_score)
+                          include_unknown_dates, direct_only, review_queue, min_score, source)
 
 
 @app.get("/stats")
 def get_stats(threshold: float = 0.1, profile_id: Optional[int] = None, direction: str = "all",
               status: str = "all", q: str = "", direct_only: bool = False,
               review_queue: bool = False, min_stars: int = 0, published_within: str = "",
-              include_unknown_dates: bool = True, min_score: float = 0):
+              include_unknown_dates: bool = True, min_score: float = 0, source: str = "all"):
     from collections import Counter
     records = list_jobs(status=status, q=q, profile_id=profile_id, direction=direction,
                         direct_only=direct_only, review_queue=review_queue, min_stars=min_stars,
                         published_within=published_within, include_unknown_dates=include_unknown_dates,
-                        min_score=min_score)
+                        min_score=min_score, source=source)
     scores = [r["match_score"] for r in records if r["match_score"] is not None]
     return {"total": len(records), "by_status": dict(Counter(r["status"] for r in records)),
             "by_source": dict(Counter(r["source"] for r in records)),
@@ -293,6 +308,14 @@ def update_status(job_id: int, body: dict):
             raise HTTPException(404, "Job not found")
         from job_lifecycle import transition
         transition(job, s, origin="user", reason=body.get("reason") or "Manual review")
+        if s == JobStatus.APPLIED and job.applied_at is None:
+            # Dragging to Applied records a decision, without replacing a
+            # detailed application or changing when an existing one was sent.
+            from db.models import Application
+            application = session.query(Application).filter_by(job_id=job_id).first()
+            job.applied_at = (
+                application.applied_at if application and application.applied_at else datetime.utcnow()
+            )
     return {"ok": True}
 
 
@@ -887,21 +910,28 @@ def get_events(job_id: int):
 @app.get("/tracker")
 def get_tracker():
     """
-    Return all jobs that have been interacted with (viewed or beyond),
-    sorted by last activity, for the tracker board.
+    Return decision stages and archived jobs with prior user interaction.
     """
     from db.session import get_session
     from db.models import Job, JobStatus, Application, JobSource
     from employers.ingestion import job_source_fields
+    from sqlalchemy import and_, or_
     active_statuses = [
-        JobStatus.VIEWED, JobStatus.CONSIDERING, JobStatus.APPLIED,
+        JobStatus.CONSIDERING, JobStatus.APPLIED,
         JobStatus.INTERVIEWING, JobStatus.OFFER,
         JobStatus.REJECTED,
     ]
     with get_session() as session:
         jobs = (
             session.query(Job)
-            .filter(Job.status.in_(active_statuses))
+            .filter(or_(
+                Job.status.in_(active_statuses),
+                and_(Job.status == JobStatus.ARCHIVED, or_(
+                    Job.status_origin == "user", Job.viewed_at.isnot(None),
+                    Job.applied_at.isnot(None), Job.user_stars > 0,
+                    Job.application.has(), Job.events.any(),
+                )),
+            ))
             .order_by(Job.updated_at.desc())
             .all()
         )

@@ -176,6 +176,27 @@ Identical role/location queries are shared between profiles; enrichment, screeni
 company lookup, publication-date backfill, and availability checks use configurable
 per-run budgets so frequent discovery is not blocked by expensive downstream work.
 
+The job list opens on **ACTIVE** (all statuses except archived). **ALL** and
+**ARCHIVED** remain available. The source filter matches every recorded source of
+a deduplicated vacancy; **Employer sites** includes roles also seen on boards.
+The separate **Not yet observed on our monitored boards** filter retains its existing meaning.
+List filters and statistics share the same query and do not change processing policies.
+
+The tracker shows decisions from **CONSIDERING** through **OFFER**, plus
+**REJECTED** and **ARCHIVED**. Drag a card or use its **Move to** selector to change
+status. Archived cards with manual decisions or prior interaction stay recoverable;
+untouched pipeline rejects are omitted. A move to Applied stamps the first application
+time without replacing an existing application record. Failed moves restore the card
+and show an error. Viewed jobs remain accessible through the job-list filter.
+
+Status controls stay above the detail tabs' scrolling content. Drag the detail pane
+divider, or focus it and use the left/right arrows, to resize it; its preferred width
+is remembered locally and constrained to the available space.
+
+These workflow adaptations preserve custom profile evaluation, LLM enhancement/routing,
+budget accounting, employer discovery, connector validation/repair, and closure rules.
+They require no schema migration.
+
 The sidebar guides you through the full pipeline:
 
 ```
