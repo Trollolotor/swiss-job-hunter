@@ -1,0 +1,27 @@
+{
+  "portal": "https://acme.recruitee.com",
+  "catalogue": {
+    "offers": [
+      {
+        "id": 123,
+        "title": "Platform Engineer",
+        "careers_url": "https://acme.recruitee.com/o/platform-engineer",
+        "careers_apply_url": "https://acme.recruitee.com/o/platform-engineer/c/new",
+        "description": "<p>Build Python services.</p>",
+        "requirements": "<ul><li>Python and SQL</li></ul>",
+        "locations": [
+          {
+            "city": "Bern",
+            "country": "Switzerland"
+          },
+          {
+            "city": "Zürich",
+            "country": "Schweiz"
+          }
+        ],
+        "remote": false,
+        "published_at": "2026-10-01T10:00:00Z"
+      }
+    ]
+  }
+}

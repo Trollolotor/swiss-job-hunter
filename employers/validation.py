@@ -18,6 +18,10 @@ def path(value, key):
 
 def complete_description(posting, observations, manifest):
     """Compare the returned ad with full source fields, not an arbitrary length."""
+    if "ats_library" in manifest:
+        from employers.ats_validation import complete_description as check
+
+        return check(posting, observations, manifest)
     candidates = []
 
     def extract(value):
@@ -66,8 +70,12 @@ def complete_description(posting, observations, manifest):
     return bool(expected) and expected in {normalize(text) for text in candidates}
 
 
-def posting_errors(posting, observations):
+def posting_errors(posting, observations, manifest=None):
     """Individually check extracted fields against bytes collected by trusted tools."""
+    if manifest and "ats_library" in manifest:
+        from employers.ats_validation import posting_errors as check
+
+        return check(posting, observations, manifest)
     from employers.network import public_url
 
     errors = []
@@ -176,6 +184,10 @@ def posting_errors(posting, observations):
 
 
 def assess(result: CollectionResult, observations, manifest):
+    if "ats_library" in manifest:
+        from employers.ats_validation import assess as check
+
+        return check(result, observations, manifest)
     errors = list(result.diagnostics)
     spec = manifest.get("catalogue", {})
     pages, observed, totals, cursors, reported_totals = [], [], [], [], []

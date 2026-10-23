@@ -1,0 +1,4 @@
+{
+  "portal": "https://career2.successfactors.eu/career?company=acme&rcm_site_locale=de_DE",
+  "catalogue": "<Job-Listing><Job><ReqId>R123</ReqId><JobTitle>Platform Engineer</JobTitle><City>Bern</City><Country>Switzerland</Country><Posted-Date>01/10/2026</Posted-Date><Job-Description><![CDATA[<p>Build Python services in [[City]].</p><p>Python and SQL</p>]]></Job-Description></Job></Job-Listing>"
+}

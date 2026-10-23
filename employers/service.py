@@ -5,8 +5,9 @@ import json
 import re
 from datetime import datetime, timedelta
 from types import SimpleNamespace
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import parse_qs, urljoin, urlsplit
 
+import httpx
 from bs4 import BeautifulSoup
 from sqlalchemy import select, update
 
@@ -29,7 +30,7 @@ from employers.adapters import ADAPTERS, SMARTRECRUITERS_MANIFEST, adapter_finge
 from employers.config import get_config
 from employers.contracts import SDK_VERSION, digest, in_coverage
 from employers.ingestion import ingest
-from employers.network import CollectionContext, public_url
+from employers.network import CollectionContext, CollectionLimit, PolicyError, public_url
 from employers.runtime import collect_generated
 from employers.validation import assess, posting_errors, repeatable
 
@@ -51,7 +52,7 @@ def row_dict(row):
     return result
 
 
-def detect_platform(url):
+def detect_platform(url, html=""):
     p = public_url(url)
     parts = [v for v in p.path.split("/") if v]
     if p.hostname == "careers.smartrecruiters.com" and parts:
@@ -61,6 +62,11 @@ def detect_platform(url):
         if not board:
             raise ValueError("Workday board is missing")
         return "workday", p.hostname.split(".")[0], board
+    from ats_vendors.registry import detect
+
+    ready = detect(url, html)
+    if ready:
+        return ready.vendor, ready.tenant, ready.board
     return "custom", p.hostname, "default"
 
 
@@ -87,10 +93,37 @@ async def verify_and_create(
 
     def canonical(url):
         p = urlsplit(url)
-        return p.hostname, p.path.rstrip("/")
+        # Legacy SuccessFactors tenants share a hostname AND a /career path.
+        # The company query parameter is part of the employer identity.
+        company = (
+            (parse_qs(p.query).get("company") or [""])[0]
+            if re.fullmatch(
+                r"[a-z0-9-]+\.(?:successfactors\.(?:com|eu)|sapsf\.(?:com|eu|cn))",
+                p.hostname or "",
+            )
+            else ""
+        )
+        return p.hostname, p.path.rstrip("/"), company
 
     if canonical(portal_url) not in {canonical(u) for u in links}:
         raise ValueError("Official page does not visibly link to the proposed career portal")
+    from ats_vendors.registry import detect, network_rules
+
+    ready = detect(portal_url)
+    portal_observation = None
+    if ready is None and detect_platform(portal_url)[0] == "custom":
+        # A branded SuccessFactors site needs observed vendor configuration,
+        # rather than a guessed hostname or text-only brand mention.
+        portal_context = CollectionContext([{"host": portal.hostname, "path": "/"}], config)
+        try:
+            portal_observation = await portal_context.fetch(portal_url)
+            ready = detect(portal_url, portal_observation.text)
+        except (httpx.HTTPError, TimeoutError, PolicyError, CollectionLimit):
+            # This optional fingerprint probe must not prevent the established
+            # custom-portal investigation/browser flow from onboarding a source.
+            pass
+        finally:
+            await portal_context.close()
     with get_session() as session:
         employer = session.get(Employer, employer_id)
         if not employer:
@@ -106,7 +139,9 @@ async def verify_and_create(
             raise ValueError("Employer identity is not evidenced on the official page")
         if session.query(EmployerSource).filter_by(enabled=True).count() >= config.max_connected:
             raise ValueError("Connected-source limit reached")
-        platform, tenant, board = detect_platform(portal_url)
+        platform, tenant, board = (
+            (ready.vendor, ready.tenant, ready.board) if ready else detect_platform(portal_url)
+        )
         namespace = f"ats:{platform}:{tenant}:{board}"
         existing = session.scalar(
             select(EmployerSource).where(EmployerSource.namespace == namespace)
@@ -134,6 +169,13 @@ async def verify_and_create(
                     "body_keys": ["appliedFacets", "limit", "offset", "searchText"],
                 }
             ]
+        source_config = {"tenant": tenant, "board": board, "portal_url": portal_url}
+        if ready:
+            from dataclasses import replace
+
+            ready = replace(ready, company=employer.name)
+            source_config = ready.config()
+            rules = network_rules(ready)
         source = EmployerSource(
             employer_id=employer_id,
             namespace=namespace,
@@ -141,7 +183,7 @@ async def verify_and_create(
             tenant=tenant,
             board=board,
             portal_url=portal_url,
-            config_json=json.dumps({"tenant": tenant, "board": board, "portal_url": portal_url}),
+            config_json=json.dumps(source_config),
             policy_json=json.dumps(rules),
         )
         session.add(source)
@@ -155,7 +197,19 @@ async def verify_and_create(
                 url=official_url,
                 source="public_observation",
                 payload_json=json.dumps(
-                    {"portal_url": portal_url, "observation_hash": observation.key}
+                    {
+                        "portal_url": portal_url,
+                        "observation_hash": observation.key,
+                        "ats_protocol": (
+                            {
+                                "vendor": ready.vendor,
+                                "variant": ready.variant,
+                                "observation_hash": portal_observation.key,
+                            }
+                            if ready and portal_observation
+                            else None
+                        ),
+                    }
                 ),
             )
         )
@@ -170,6 +224,15 @@ def candidate(
         source = session.get(EmployerSource, source_id)
         if not source:
             raise ValueError("Source not found")
+        if manifest and "ats_library" in manifest:
+            from employers.ats_validation import definition
+            from ats_vendors.registry import from_config
+
+            defined, _ = definition(manifest)
+            bound = from_config(source.platform, json.loads(source.config_json))
+            configured = from_config(source.platform, config or json.loads(source.config_json))
+            if defined != bound or configured != bound:
+                raise ValueError("Ready connector library does not match its source configuration")
         kind = "builtin" if source.platform in ADAPTERS and not code else "generated"
         if kind == "generated":
             if len(code.encode()) > 100_000:
@@ -283,6 +346,16 @@ async def run_version(version_id, *, validation=False, context_factory=None, fen
         source_obj = SimpleNamespace(
             **{c.name: getattr(source, c.name) for c in source.__table__.columns}
         )
+        saved_manifest = json.loads(version_obj.manifest_json)
+        if "ats_library" in saved_manifest:
+            from employers.ats_validation import definition
+
+            try:
+                definition(saved_manifest)
+            except ValueError as exc:
+                from employers.runtime import RuntimeUnavailable
+
+                raise RuntimeUnavailable(str(exc)) from exc
         scope = digest([version.digest, config.coverage])
         run = SourceRun(
             source_id=source.id, version_id=version.id, scope=scope, validation=validation
@@ -303,6 +376,7 @@ async def run_version(version_id, *, validation=False, context_factory=None, fen
     )
     context.fence = fence
     context.catalogue_spec = json.loads(version_obj.manifest_json).get("catalogue", {})
+    context.manifest = json.loads(version_obj.manifest_json)
     context.fresh_detail_keys, context.staged, context.catalogue_entries = set(), [], []
     result = None
     try:
@@ -355,7 +429,10 @@ async def run_version(version_id, *, validation=False, context_factory=None, fen
                     session,
                     context,
                     context.catalogue_entries,
-                    [p for p in result.postings if not posting_errors(p, context.observations)],
+                    [
+                        p for p in result.postings
+                        if not posting_errors(p, context.observations, context.manifest)
+                    ],
                 )
                 _finalize_collection(
                     session,
@@ -367,6 +444,7 @@ async def run_version(version_id, *, validation=False, context_factory=None, fen
                     config,
                     run_id,
                     context.observations,
+                    context.manifest,
                 )
                 run.outcome = assessment["outcome"]
                 run.stats_json = json.dumps(assessment)
@@ -409,6 +487,7 @@ async def run_version(version_id, *, validation=False, context_factory=None, fen
                     config,
                     run_id,
                     context.observations,
+                    context.manifest,
                 )
                 run.outcome = "partial"
                 assessment.update(
@@ -426,7 +505,7 @@ async def run_version(version_id, *, validation=False, context_factory=None, fen
 
 
 def _finalize_collection(
-    session, source, version_id, scope, result, assessment, config, run_id, observations
+    session, source, version_id, scope, result, assessment, config, run_id, observations, manifest=None
 ):
     if not source.enabled or source.active_version_id != version_id:
         return
@@ -476,7 +555,7 @@ def _finalize_collection(
             if not in_coverage(posting, config.coverage):
                 continue
             # Partial extraction can contribute only individually evidenced valid rows.
-            if posting_errors(posting, observations):
+            if posting_errors(posting, observations, manifest):
                 continue
             job, _, record = ingest(session, posting.job, source=source, posting=posting)
             from analyzer.matching import local_evaluate
@@ -536,6 +615,10 @@ async def validate_activate(version_id, *, context_factory=None, fence=None):
             report = {"first": first, "second": second, "repeatable": repeatable(first, second)}
             version.validation_json = json.dumps(report)
         if not report["repeatable"]:
+            if first.get("limitation") or second.get("limitation"):
+                raise CollectionLimit(
+                    "Vendor catalogue completeness is limited by the source's result cap/page budget"
+                )
             failures = list(dict.fromkeys(first.get("errors", []) + second.get("errors", [])))
             raise ValueError(
                 "Candidate failed completeness or stable identity validation: "

@@ -1,0 +1,28 @@
+{
+  "portal": "https://acme.wd3.myworkdayjobs.com/en-US/Careers",
+  "catalogue": {
+    "total": 1,
+    "jobPostings": [
+      {
+        "title": "Platform Engineer",
+        "externalPath": "/job/Bern/Platform-Engineer_R123",
+        "locationsText": "2 Locations"
+      }
+    ]
+  },
+  "detail": {
+    "jobPostingInfo": {
+      "title": "Platform Engineer",
+      "jobDescription": "<h2>Responsibilities</h2><p>Build Python services.</p><h2>Requirements</h2><ul><li>Python and SQL</li></ul>",
+      "location": "Bern, Switzerland",
+      "additionalLocations": [
+        "Zürich, Schweiz"
+      ],
+      "jobReqId": "R123",
+      "externalUrl": "https://acme.wd3.myworkdayjobs.com/Careers/job/Bern/Platform-Engineer_R123",
+      "timeType": "Full time",
+      "remoteType": "Hybrid",
+      "datePosted": "2026-10-01T10:00:00Z"
+    }
+  }
+}

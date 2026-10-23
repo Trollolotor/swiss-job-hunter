@@ -3,6 +3,7 @@
 import json
 import os
 import time
+from dataclasses import asdict
 from pathlib import Path
 
 from employers.contracts import digest
@@ -17,7 +18,8 @@ def root():
 
 
 def save(observations, failure=False):
-    value = [o.__dict__ for o in observations]
+    # Persist broker fields only, excluding transient trusted parsing indexes.
+    value = [asdict(o) for o in observations]
     raw = json.dumps(value, ensure_ascii=False).encode()
     if len(raw) > 100 * 1024 * 1024:
         raise ValueError("Diagnostic bundle exceeds limit")

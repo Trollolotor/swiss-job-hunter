@@ -28,9 +28,11 @@ Vacancy source records preserve per-source identities and content revisions. Exi
 job IDs, primary board URLs, profile links, events, and applications remain intact. Direct links
 appear as preferred application links. No application is submitted by this subsystem.
 
-The initial maintained adapter is SmartRecruiters. Other platforms use the controlled SDK and
-require a validated generated connector. The Workday fixture in `tests/fixtures/` is a test input,
-not a pre-approved or silently installed production adapter.
+SmartRecruiters retains its maintained adapter. Recognized Workable, SuccessFactors, Workday,
+Greenhouse, Lever, Ashby, Recruitee and Teamtailor portals first try the
+[internal ATS libraries](ats-libraries.md). They run through the controlled SDK and the same
+candidate validation gates. Unsupported variants retain bounded connector generation/repair.
+Existing custom connectors are not automatically replaced.
 
 ## Schema upgrade and backup
 
@@ -175,9 +177,9 @@ official-page verification, candidate validation, fixture replay, activation, an
 collection. It deliberately clears provider credentials. Allow several minutes for polite requests.
 Access challenges are recorded as failures, not bypassed.
 
-Swisscom's official page currently links to Workday. A paid generation pilot requires the new
-budget/prices to be entered, both runtime images to be pinned and installed, and host isolation
-checks to pass. Do not describe a mocked generation test as a live LLM-generated connector.
+Swisscom's official page currently links to Workday. A ready-library pilot requires matching pinned
+runtime images and host isolation checks. A paid generation pilot additionally requires the new
+budget/prices to be entered. Do not describe a mocked generation test as a live LLM-generated connector.
 
 ## Rollback and measurement
 

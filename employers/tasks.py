@@ -24,7 +24,7 @@ from db.session import get_session, init_db
 from employers.agent import step
 from employers.budget import BudgetUnavailable
 from employers.config import get_config
-from employers.network import CollectionContext, PolicyError
+from employers.network import CollectionContext, CollectionLimit, PolicyError
 from employers.runtime import RuntimeUnavailable
 from employers.service import (
     candidate,
@@ -348,6 +348,20 @@ async def _generate(task, source, repair=False, incident=None):
         "catalogue_schema": CatalogueResult.model_json_schema(),
         "result_schema": CollectionResult.model_json_schema(),
     }
+    from ats_vendors.registry import VENDORS
+
+    evidence["sdk"]["installed_libraries"] = {
+        "ats_core": "Pure parsing helpers and plain value objects; no I/O or application imports.",
+        "ats_vendors": list(VENDORS),
+        "usage": (
+            "These packages are installed in newly built runner images. Vendor modules expose "
+            "detect, catalogue_request, parse_catalogue, detail_request and parse_posting. "
+            "Use SDK fetch for all I/O. An ats_library manifest invokes the exact reviewed "
+            "vendor parser as trusted validation; omit that key for custom extraction and "
+            "supply the existing JSON/HTML catalogue and detail manifest instead. Keep all "
+            "observed description sections, stable source IDs and real evidence keys."
+        ),
+    }
     if evidence["sdk_version"] == "1":
         evidence["sdk"]["functions"] = {
             "collect(config, sdk)": "returns CollectionResult dictionary"
@@ -530,6 +544,10 @@ async def execute_task(task):
                     _finish(task, "completed")
                     return
                 if result["outcome"] in {"partial", "failed"}:
+                    if result.get("limitation"):
+                        raise CollectionLimit(
+                            "Vendor catalogue exceeds supported complete-collection limits"
+                        )
                     raise ValueError("; ".join(result["errors"]))
             elif task["kind"] == "revalidate":
                 with get_session() as session:
@@ -537,15 +555,22 @@ async def execute_task(task):
                     if not current:
                         raise ValueError("No active connector is available for revalidation")
                     saved = row_dict(current)
-                version_id = candidate(
-                    source["id"],
-                    code=saved["code"],
-                    manifest=saved["manifest"],
-                    config=saved["config"],
-                    parent_id=saved["id"],
-                    image_digest=os.environ.get("EMPLOYER_RUNNER_IMAGE", ""),
-                    policy=saved["manifest"].get("network_policy"),
-                )
+                if "ats_library" in saved["manifest"]:
+                    from employers.ready import ready_candidate
+
+                    version_id = ready_candidate(source)
+                    if version_id is None:
+                        raise ValueError("The stored source no longer matches a ready ATS protocol")
+                else:
+                    version_id = candidate(
+                        source["id"],
+                        code=saved["code"],
+                        manifest=saved["manifest"],
+                        config=saved["config"],
+                        parent_id=saved["id"],
+                        image_digest=os.environ.get("EMPLOYER_RUNNER_IMAGE", ""),
+                        policy=saved["manifest"].get("network_policy"),
+                    )
                 await validate_activate(version_id, fence=lambda: fenced(task))
             elif task["kind"] == "validate":
                 version_id = task["payload"]["version_id"]
@@ -584,7 +609,11 @@ async def execute_task(task):
                 if source["platform"] == "smartrecruiters" and not repair_mode:
                     version_id = candidate(source["id"], parent_id=source["active_version_id"])
                 else:
-                    version_id = await _generate(task, source, repair_mode, incident)
+                    from employers.ready import ready_candidate
+
+                    version_id = None if repair_mode else ready_candidate(source)
+                    if version_id is None:
+                        version_id = await _generate(task, source, repair_mode, incident)
                 await validate_activate(version_id, fence=lambda: fenced(task))
                 enqueue("collect", source_id=source["id"])
             else:
@@ -616,6 +645,14 @@ async def execute_task(task):
             if task["source_id"]:
                 source = session.get(EmployerSource, task["source_id"])
                 source.enabled, source.health, source.last_error = False, "blocked", str(exc)
+        _finish(task, "needs_review", str(exc))
+    except CollectionLimit as exc:
+        # Larger feeds/page caps are resource/scope limitations. Regenerating
+        # extraction code cannot justify raising the trusted collection limits.
+        if task["source_id"]:
+            with get_session() as session:
+                source = session.get(EmployerSource, task["source_id"])
+                source.health, source.last_error = "degraded", str(exc)[:2000]
         _finish(task, "needs_review", str(exc))
     except asyncio.CancelledError:
         _finish(task, "queued", "Task interrupted; will resume", 60)

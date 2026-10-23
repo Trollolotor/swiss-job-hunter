@@ -1,6 +1,7 @@
 """Trusted version-scoped details; generated code never gets a database handle."""
 
 import json
+from dataclasses import asdict
 from datetime import datetime, timedelta
 from urllib.parse import urlsplit
 
@@ -35,6 +36,10 @@ def cached(context, entry):
         ):
             raise CollectionLimit("Cached evidence exceeds collection budget")
         posting = CollectedPosting.model_validate_json(row.posting_json)
+        if getattr(context, "manifest", {}).get("ats_library"):
+            # Catalogue bytes are always fresh. Bind cached detail evidence to
+            # this run's record instead of replaying an old whole-board snapshot.
+            posting.evidence = [entry.metadata["catalogue_key"], *[o.key for o in observations]]
     context.cached_bytes = getattr(context, "cached_bytes", 0) + added
     context.observations.extend(observations)
     context.cache_hits = getattr(context, "cache_hits", 0) + 1
@@ -82,7 +87,9 @@ def save(session, context, entries, postings):
             session.add(existing)
         from employers.validation import posting_errors
 
-        if posting_errors(posting, observations):
+        manifest = getattr(context, "manifest", None)
+        checked = context.observations if manifest and "ats_library" in manifest else observations
+        if posting_errors(posting, checked, manifest):
             # Some connectors need listing fields too; safely fetch details again.
             if existing.id is None:
                 session.expunge(existing)
@@ -93,7 +100,7 @@ def save(session, context, entries, postings):
             continue
         existing.token = entry.change_token
         existing.posting_json = posting.model_dump_json()
-        existing.evidence_json = json.dumps([o.__dict__ for o in observations])
+        existing.evidence_json = json.dumps([asdict(o) for o in observations])
         existing.fetched_at = datetime.utcnow()
     session.query(DetailCache).filter(
         DetailCache.fetched_at < datetime.utcnow() - timedelta(days=2)

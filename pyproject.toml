@@ -58,7 +58,7 @@ py-modules = ["cli", "sjh_entry"]
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["config*", "scrapers*", "dedup*", "db*", "analyzer*", "llm*", "applicator*", "employers*"]
+include = ["config*", "scrapers*", "dedup*", "db*", "analyzer*", "llm*", "applicator*", "employers*", "ats_core*", "ats_vendors*"]
 
 [tool.setuptools.package-data]
 "llm" = ["prompts/*.txt"]

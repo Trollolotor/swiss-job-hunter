@@ -1,0 +1,38 @@
+{
+  "portal": "https://jobs.ashbyhq.com/acme",
+  "catalogue": {
+    "jobs": [
+      {
+        "id": "ashby-123",
+        "title": "Platform Engineer",
+        "jobUrl": "https://jobs.ashbyhq.com/acme/ashby-123",
+        "applyUrl": "https://jobs.ashbyhq.com/acme/ashby-123/application",
+        "descriptionHtml": "<h2>Responsibilities</h2><p>Build Python services.</p><h2>Requirements</h2><ul><li>Python and SQL</li></ul>",
+        "location": "Bern, Switzerland",
+        "address": {
+          "postalAddress": {
+            "addressLocality": "Bern",
+            "addressCountry": "CH"
+          }
+        },
+        "secondaryLocations": [
+          {
+            "location": "Zürich, Switzerland",
+            "address": {
+              "postalAddress": {
+                "addressLocality": "Zürich",
+                "addressCountry": "CH"
+              }
+            }
+          }
+        ],
+        "publishedAt": "2026-10-01T10:00:00Z",
+        "workplaceType": "Hybrid",
+        "isRemote": true,
+        "compensation": {
+          "compensationTierSummary": "CHF 100,000–130,000"
+        }
+      }
+    ]
+  }
+}
